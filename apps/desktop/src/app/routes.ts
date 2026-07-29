@@ -18,13 +18,18 @@ export const CRON_ROUTE = '/cron'
 export const PROFILES_ROUTE = '/profiles'
 export const AGENTS_ROUTE = '/agents'
 export const STARMAP_ROUTE = '/starmap'
+export const SANAD_ROUTE = '/sanad'
+export const BUILD_ROUTE = '/build'
+export const DESIGN_ROUTE = '/design'
 
 export type AppView =
   | 'agents'
   | 'artifacts'
+  | 'build'
   | 'chat'
   | 'command-center'
   | 'cron'
+  | 'design'
   // A contributed (plugin) full page at its own route — NOT chat. Without this
   // distinction contributed paths fell through appViewForPath's 'chat' default,
   // so the sidebar kept a session highlighted and the titlebar kept the
@@ -32,6 +37,7 @@ export type AppView =
   | 'extension'
   | 'messaging'
   | 'profiles'
+  | 'sanad'
   | 'settings'
   | 'skills'
   | 'starmap'
@@ -40,11 +46,14 @@ export type AppView =
 export type AppRouteId =
   | 'agents'
   | 'artifacts'
+  | 'build'
   | 'command-center'
   | 'cron'
+  | 'design'
   | 'messaging'
   | 'new'
   | 'profiles'
+  | 'sanad'
   | 'settings'
   | 'skills'
   | 'starmap'
@@ -58,6 +67,9 @@ export interface AppRoute {
 
 export const APP_ROUTES = [
   { id: 'new', path: NEW_CHAT_ROUTE, view: 'chat' },
+  { id: 'sanad', path: SANAD_ROUTE, view: 'sanad' },
+  { id: 'build', path: BUILD_ROUTE, view: 'build' },
+  { id: 'design', path: DESIGN_ROUTE, view: 'design' },
   { id: 'settings', path: SETTINGS_ROUTE, view: 'settings' },
   { id: 'command-center', path: COMMAND_CENTER_ROUTE, view: 'command-center' },
   { id: 'skills', path: SKILLS_ROUTE, view: 'skills' },

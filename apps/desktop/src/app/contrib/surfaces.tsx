@@ -35,6 +35,9 @@ import type { SidebarActions, WiringActions } from './types'
 const ArtifactsView = lazy(async () => ({ default: (await import('../artifacts')).ArtifactsView }))
 const MessagingView = lazy(async () => ({ default: (await import('../messaging')).MessagingView }))
 const SkillsView = lazy(async () => ({ default: (await import('../skills')).SkillsView }))
+const SanadModePage = lazy(async () => ({ default: (await import('../burooj/mode-page')).SanadModePage }))
+const BuildModePage = lazy(async () => ({ default: (await import('../burooj/mode-page')).BuildModePage }))
+const DesignModePage = lazy(async () => ({ default: (await import('../burooj/mode-page')).DesignModePage }))
 
 export function LegacySessionRedirect() {
   const { sessionId } = useParams()
@@ -167,6 +170,9 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       <Route element={page(<SkillsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="skills" />
       <Route element={page(<MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="messaging" />
       <Route element={page(<ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="artifacts" />
+      <Route element={page(<SanadModePage />)} path="sanad" />
+      <Route element={page(<BuildModePage />)} path="build" />
+      <Route element={page(<DesignModePage />)} path="design" />
       <Route element={null} path="agents" />
       <Route element={null} path="command-center" />
       <Route element={null} path="cron" />
