@@ -42,15 +42,14 @@ export function BuroojModeSelector() {
           className="h-7 w-full justify-between rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-control-active-background) px-2 text-left text-[0.8125rem] font-medium text-(--ui-text-secondary) shadow-none hover:bg-(--ui-control-hover-background) hover:text-foreground"
           size="sm"
         >
-          <SelectValue placeholder="Agent" />
+          <SelectValue placeholder="Agent">
+            {BUROOJ_MODES.find(m => m.id === mode)?.label ?? 'Agent'}
+          </SelectValue>
         </SelectTrigger>
         <SelectContent align="start" className="min-w-[var(--radix-select-trigger-width)]">
           {BUROOJ_MODES.map(option => (
             <SelectItem key={option.id} value={option.id}>
-              <span className="flex flex-col gap-0.5 py-0.5">
-                <span className="text-[0.8125rem] font-medium leading-none">{option.label}</span>
-                <span className="text-[0.6875rem] font-normal text-(--ui-text-quaternary)">{option.subtitle}</span>
-              </span>
+              {option.label}
             </SelectItem>
           ))}
         </SelectContent>
