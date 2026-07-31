@@ -668,3 +668,34 @@ class TestOperatorInstructionsScope:
         assert mode.is_coding
         blocks = mode.system_blocks()
         assert any("Clean the diff." in b for b in blocks)
+
+
+class TestContextProfilePersistence:
+    """context_profile must survive a DB round-trip (session resume)."""
+
+    def test_context_profile_persists_in_session_db(self, tmp_path):
+        """The context_profile column stores and returns the mode on resume."""
+        import sys
+        sys.path.insert(0, str(tmp_path.parent.parent))
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session("sess_build", source="desktop")
+            db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET context_profile = ? WHERE id = ?",
+                    ("build", "sess_build"),
+                )
+            )
+            row = db.get_session("sess_build")
+            assert row is not None
+            assert row["context_profile"] == "build"
+
+            # A session without context_profile returns None
+            db.create_session("sess_plain", source="desktop")
+            row2 = db.get_session("sess_plain")
+            assert row2 is not None
+            assert row2.get("context_profile") is None
+        finally:
+            db.close()

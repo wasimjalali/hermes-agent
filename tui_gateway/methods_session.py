@@ -608,6 +608,7 @@ def _(rid, params: dict) -> dict:
                 session_id=target,
                 session_db=db,
                 platform_override=source,
+                context_profile=found.get("context_profile") or None,
                 **stored_runtime_overrides,
             )
         finally:
