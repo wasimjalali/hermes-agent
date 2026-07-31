@@ -438,6 +438,7 @@ def _(rid, params: dict) -> dict:
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             profile_home=profile_home,
             lazy=True,
+            context_profile=found.get("context_profile") or None,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
@@ -465,7 +466,7 @@ def _(rid, params: dict) -> dict:
                 "resumed": target,
                 "message_count": len(messages),
                 "messages": messages,
-                "info": _lazy_resume_info(cwd, profile=profile),
+                "info": _lazy_resume_info(cwd, profile=profile, context_profile=found.get("context_profile") or None),
                 "inflight": None,
                 "running": child_running,
                 "session_key": target,
@@ -529,6 +530,7 @@ def _(rid, params: dict) -> dict:
             profile_home=profile_home,
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
+            context_profile=found.get("context_profile") or None,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
@@ -548,6 +550,7 @@ def _(rid, params: dict) -> dict:
                 model=model_override.get("model") or "",
                 provider=overrides.get("provider_override") or "",
                 profile=profile,
+                context_profile=found.get("context_profile") or None,
             ),
             "inflight": None,
             "running": False,

@@ -2484,6 +2484,15 @@ def _ensure_session_db_row(session: dict) -> None:
             # means the launch/default profile (matches run_agent's convention).
             profile_name=Path(profile_home).name if profile_home else None,
         )
+        # Burooj mode profile: persist so session.resume restores the posture.
+        ctx_profile = session.get("context_profile")
+        if ctx_profile and hasattr(db, "_execute_write"):
+            db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET context_profile = ? WHERE id = ?",
+                    (ctx_profile, key),
+                )
+            )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
     finally:
@@ -7194,6 +7203,7 @@ def _lazy_resume_info(
     model: str = "",
     provider: str = "",
     profile: str | None = None,
+    context_profile: str | None = None,
 ) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
@@ -7210,6 +7220,8 @@ def _lazy_resume_info(
     }
     if provider:
         info["provider"] = provider
+    if context_profile:
+        info["context_profile"] = context_profile
     return info
 
 
@@ -7227,6 +7239,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    context_profile: str | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -7239,6 +7252,7 @@ def _deferred_session_record(
         "close_on_disconnect": close_on_disconnect,
         "active_session_lease": lease,
         "cols": cols,
+        "context_profile": context_profile,
         "created_at": now,
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
