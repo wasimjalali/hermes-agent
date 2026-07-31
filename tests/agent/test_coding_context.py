@@ -533,3 +533,45 @@ class TestDetection:
     def test_bare_dir_is_not_coding(self, tmp_path):
         cfg = {"agent": {"coding_context": "auto"}}
         assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is False
+
+
+# ── Burooj mode profile integration ─────────────────────────────────────────
+
+class TestBuroojAgentModePreservesCodingPosture:
+    """Agent mode must not override auto-detect, preserving the coding posture."""
+
+    def test_agent_profile_same_as_no_profile_in_code_workspace(self, tmp_path):
+        """In a code workspace, profile='agent' resolves identically to no profile."""
+        _git_init(tmp_path)
+        cfg = {"agent": {"coding_context": "auto"}}
+        no_pin = cc.resolve_runtime_mode(platform="desktop", cwd=tmp_path, config=cfg)
+        agent_pin = cc.resolve_runtime_mode(
+            platform="desktop", cwd=tmp_path, config=cfg, profile="agent"
+        )
+        # Same profile (coding), same block count, same workspace block.
+        assert no_pin.profile.name == agent_pin.profile.name
+        assert no_pin.is_coding == agent_pin.is_coding
+        no_blocks = no_pin.system_blocks()
+        agent_blocks = agent_pin.system_blocks()
+        assert len(no_blocks) == len(agent_blocks)
+        # Workspace block must be present in both.
+        assert any("Workspace" in b for b in no_blocks)
+        assert any("Workspace" in b for b in agent_blocks)
+
+    def test_agent_profile_not_pinned(self, tmp_path):
+        """profile='agent' must not set pinned=True (it falls through to detect)."""
+        _git_init(tmp_path)
+        mode = cc.resolve_runtime_mode(
+            platform="desktop", cwd=tmp_path, config={}, profile="agent"
+        )
+        assert mode.pinned is False
+
+    def test_specialisation_profiles_still_pin(self, tmp_path):
+        """sanad, build, design still override detection when passed."""
+        _git_init(tmp_path)
+        for name in ("sanad", "build", "design"):
+            mode = cc.resolve_runtime_mode(
+                platform="desktop", cwd=tmp_path, config={}, profile=name
+            )
+            assert mode.pinned is True
+            assert mode.profile.name == name

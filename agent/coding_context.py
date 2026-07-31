@@ -616,13 +616,18 @@ def resolve_runtime_mode(
 
     ``profile`` — when supplied and registered, wins over auto-detection and
     sets ``RuntimeMode.pinned``. An unregistered name falls back to normal
-    detection (no raise).
+    detection (no raise). The special case ``"agent"`` also falls through to
+    detection: Agent is the default all-rounder, and pinning it would lose the
+    coding posture in a code workspace.
     """
     resolved_cwd = _resolve_cwd(cwd)
     mode = _coding_mode(config)
     pinned = False
     requested = (profile or "").strip()
-    if requested and requested in _PROFILES:
+    if requested and requested in _PROFILES and requested != "agent":
+        # Genuine specialisations (sanad, build, design) pin and override
+        # detection. "agent" is the default all-rounder: it must not override
+        # auto-detect, or a code workspace loses the coding posture.
         name = requested
         pinned = True
     else:
