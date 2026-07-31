@@ -1963,6 +1963,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                if profile := current.get("context_profile"):
+                    kw["context_profile"] = profile
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -3723,7 +3725,7 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
-def _load_enabled_toolsets() -> list[str] | None:
+def _load_enabled_toolsets(context_profile: str | None = None) -> list[str] | None:
     explicit = [
         item.strip()
         for item in os.environ.get("HERMES_TUI_TOOLSETS", "").split(",")
@@ -3732,17 +3734,18 @@ def _load_enabled_toolsets() -> list[str] | None:
     cfg = None
     fallback_notice = None
 
-    # Coding posture (base Hermes): with no explicit pin, collapse to the
-    # coding toolset (+ enabled MCP servers) when sitting in a code workspace.
-    # The desktop app and `hermes --tui` both land here. See
-    # agent/coding_context.py. No config is loaded yet at this point, so we let
-    # coding_selection() load it lazily (cli.py passes its already-resolved
-    # CLI_CONFIG instead, purely to avoid a redundant read).
+    # Coding / Burooj posture: with no explicit pin, collapse to the profile
+    # toolset (+ enabled MCP servers) when sitting in a code workspace or when
+    # a Burooj mode profile is pinned on the session. The desktop app and
+    # `hermes --tui` both land here. See agent/coding_context.py.
     if not explicit:
         try:
             from agent.coding_context import coding_selection
 
-            selection = coding_selection(platform=_resolve_session_platform())
+            selection = coding_selection(
+                platform=_resolve_session_platform(),
+                profile=context_profile,
+            )
             if selection is not None:
                 # Fold in `project` here too: this is a GUI-only resolver, and
                 # the focus-mode coding posture returns before the fallback path
@@ -4708,6 +4711,14 @@ def _session_info(agent, session: dict | None = None) -> dict:
         if isinstance(session, dict) and session.get("profile_home")
         else _current_profile_name(),
     }
+    # Burooj mode profile pinned on this session (agent/sanad/build/design).
+    context_profile = None
+    if isinstance(session, dict):
+        context_profile = session.get("context_profile") or None
+    if not context_profile and agent is not None:
+        context_profile = getattr(agent, "context_profile", None) or None
+    if context_profile:
+        info["context_profile"] = str(context_profile)
     try:
         from hermes_cli import __version__, __release_date__
 
@@ -5557,6 +5568,7 @@ def _agent_fallback_model(agent):
 
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
+    context_profile = getattr(agent, "context_profile", None) or None
 
     return {
         "base_url": getattr(agent, "base_url", None) or None,
@@ -5568,7 +5580,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
-        or _load_enabled_toolsets(),
+        or _load_enabled_toolsets(context_profile=context_profile),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -5739,6 +5751,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            context_profile=session.get("context_profile") or None,
         )
     finally:
         _clear_session_context(tokens)
@@ -5906,6 +5919,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    context_profile: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -6034,7 +6048,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6060,7 +6074,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=_load_enabled_toolsets(context_profile=context_profile),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -6081,6 +6095,11 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    # Per-session Burooj mode profile. system_prompt + compact skills read this
+    # via getattr so resolve_runtime_mode(profile=...) pins the posture.
+    if context_profile:
+        setattr(agent, "context_profile", context_profile)
+    return agent
 
 
 def _init_session(
@@ -6120,6 +6139,8 @@ def _init_session(
             # launch profile. SessionBranch copies the parent's value so the
             # child stays on the same state.db.
             "profile_home": profile_home,
+            # Burooj mode profile carried from parent agent on branch/resume.
+            "context_profile": getattr(agent, "context_profile", None) or None,
             # Per-session model override set by an in-session /model switch.
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.

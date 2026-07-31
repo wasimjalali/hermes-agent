@@ -330,6 +330,11 @@ def get_profile(name: str) -> ContextProfile:
     return _PROFILES.get(name, GENERAL_PROFILE)
 
 
+def register_profile(profile: ContextProfile) -> None:
+    """Insert or replace a profile in the registry by name."""
+    _PROFILES[profile.name] = profile
+
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
@@ -484,7 +489,8 @@ class RuntimeMode:
     surface: str
     cwd: Path
     # The normalized ``agent.coding_context`` mode this posture was resolved
-    # under (auto/focus/on/off). Toolset collapse is gated on ``focus``.
+    # under (auto/focus/on/off). Toolset collapse is gated on ``focus`` or an
+    # explicitly pinned profile (user-selected mode).
     config_mode: str = "auto"
     # The model id this session runs (e.g. "anthropic/claude-opus-4.8"). Used
     # only to steer edit-format guidance toward the model's family — see
@@ -493,6 +499,10 @@ class RuntimeMode:
     # Standing operator instructions (``agent.coding_instructions``), appended
     # as an extra stable system block. Empty unless the user configures it.
     instructions: str = ""
+    # True when the caller passed an explicit registered profile name (e.g. a
+    # Burooj mode). Pinned profiles collapse toolset/skill index even under
+    # ``auto`` coding_context, because the user chose the mode deliberately.
+    pinned: bool = False
 
     @property
     def kind(self) -> str:
@@ -505,16 +515,16 @@ class RuntimeMode:
     def toolset_selection(self, config: Optional[dict[str, Any]] = None) -> Optional[list[str]]:
         """Toolset list for this posture, or ``None`` to keep the platform default.
 
-        Non-``None`` only under the opt-in ``focus`` mode. The default posture
-        is prompt-only: most strippable toolsets are off-by-default anyway, and
-        a user who explicitly enabled one (image-gen for frontend/game assets,
-        messaging for build notifications, …) keeps it while coding.
+        Non-``None`` under the opt-in ``focus`` mode, or when a profile was
+        explicitly pinned (Burooj mode selection). The default unpinned
+        posture is prompt-only: most strippable toolsets are off-by-default
+        anyway, and a user who explicitly enabled one keeps it while coding.
 
         Callers apply this only when the user hasn't pinned an explicit
         selection (``--toolsets``, ``HERMES_TUI_TOOLSETS``, …); they never
         override a pin. Returns the profile's toolset plus enabled MCP servers.
         """
-        if self.config_mode != "focus":
+        if not self.pinned and self.config_mode != "focus":
             return None
         if self.profile.toolset is None:
             return None
@@ -531,24 +541,30 @@ class RuntimeMode:
         the live workspace snapshot, then configured operator instructions.
         Prompt assembly can therefore put a cache boundary before the snapshot
         without changing the persisted system-prompt bytes.
+
+        Non-coding profiles with a non-empty ``guidance`` (Burooj modes) inject
+        the brief only. The coding workspace snapshot and operator coding
+        instructions still require the coding posture.
         """
-        if not self.is_coding:
+        if not self.profile.guidance and not self.is_coding:
             return [], [], []
         prefix: list[str] = []
         workspace_parts: list[str] = []
         trailing: list[str] = []
         if self.profile.guidance:
             brief = self.profile.guidance
-            edit_line = _edit_format_line(self.model)
-            if edit_line:
-                brief = f"{brief}\n{edit_line}"
+            if self.is_coding or self.profile.model_hint == "coding":
+                edit_line = _edit_format_line(self.model)
+                if edit_line:
+                    brief = f"{brief}\n{edit_line}"
             prefix.append(brief)
-        workspace = build_coding_workspace_block(self.cwd)
-        if workspace:
-            workspace_parts.append(workspace)
+        if self.is_coding or self.profile.memory_policy == "project":
+            workspace = build_coding_workspace_block(self.cwd)
+            if workspace:
+                workspace_parts.append(workspace)
         # Operator instructions ride their own block so the brief (block 0) stays
         # byte-stable and cache-keyed independently of user config.
-        if self.instructions:
+        if self.instructions and (self.is_coding or self.pinned):
             trailing.append(f"Operator instructions (from config):\n{self.instructions}")
         return prefix, workspace_parts, trailing
 
@@ -564,22 +580,19 @@ class RuntimeMode:
     def compact_skill_categories(self) -> frozenset[str]:
         """Skill categories to demote to names-only in the prompt's skill index.
 
-        Gated on the opt-in ``focus`` mode, like the toolset collapse: the
-        default posture leaves the skill index untouched. Users who didn't ask
-        for a lean prompt keep full entries for every category — index changes
-        under ``auto`` proved too surprising in practice, even names-only ones
-        (a demoted description is information the model no longer weighs when
-        deciding what to load).
+        Gated on the opt-in ``focus`` mode or an explicitly pinned profile,
+        like the toolset collapse: the default unpinned posture leaves the
+        skill index untouched.
 
-        Demoted — never hidden — even under ``focus``. An earlier revision
-        fully pruned these categories from the index, which caused silent
-        capability loss in a real workflow: agent-created skills are the
+        Demoted — never hidden — even under ``focus``/pinned. An earlier
+        revision fully pruned these categories from the index, which caused
+        silent capability loss in a real workflow: agent-created skills are the
         model's accumulated project memory (server-ops runbooks, learned
         pitfalls, …), and models do not reliably reach for ``skills_list`` to
         rediscover what the index stopped showing them. Names-only keeps every
         skill loadable on recall while still cutting the description noise.
         """
-        if not self.is_coding or self.config_mode != "focus":
+        if not self.pinned and self.config_mode != "focus":
             return frozenset()
         return frozenset(self.profile.compact_skill_categories)
 
@@ -590,6 +603,7 @@ def resolve_runtime_mode(
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> RuntimeMode:
     """Resolve the operating posture once. Cheap — a handful of ``stat`` calls.
 
@@ -599,12 +613,22 @@ def resolve_runtime_mode(
     process can't pin a stale posture; callers resolve once per session and
     hold the result. ``model`` is recorded only to steer edit-format guidance;
     it never affects detection.
+
+    ``profile`` — when supplied and registered, wins over auto-detection and
+    sets ``RuntimeMode.pinned``. An unregistered name falls back to normal
+    detection (no raise).
     """
     resolved_cwd = _resolve_cwd(cwd)
     mode = _coding_mode(config)
-    name = _detect_profile_name(
-        mode, (platform or "").strip().lower(), str(resolved_cwd)
-    )
+    pinned = False
+    requested = (profile or "").strip()
+    if requested and requested in _PROFILES:
+        name = requested
+        pinned = True
+    else:
+        name = _detect_profile_name(
+            mode, (platform or "").strip().lower(), str(resolved_cwd)
+        )
     return RuntimeMode(
         profile=get_profile(name),
         surface=platform or "",
@@ -612,6 +636,7 @@ def resolve_runtime_mode(
         config_mode=mode,
         model=model,
         instructions=_coding_instructions(config),
+        pinned=pinned,
     )
 
 
@@ -623,9 +648,12 @@ def is_coding_context(
     platform: Optional[str] = None,
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
+    profile: Optional[str] = None,
 ) -> bool:
     """Whether Hermes should operate in its coding posture right now."""
-    return resolve_runtime_mode(platform=platform, cwd=cwd, config=config).is_coding
+    return resolve_runtime_mode(
+        platform=platform, cwd=cwd, config=config, profile=profile
+    ).is_coding
 
 
 def coding_selection(
@@ -633,14 +661,16 @@ def coding_selection(
     platform: Optional[str] = None,
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
+    profile: Optional[str] = None,
 ) -> Optional[list[str]]:
-    """Toolset selection for the coding posture.
+    """Toolset selection for the active posture.
 
-    ``None`` unless the user opted into ``focus`` mode AND the posture is
-    active — the default coding posture never overrides configured toolsets.
+    ``None`` unless the user opted into ``focus`` mode or pinned an explicit
+    profile — the default unpinned coding posture never overrides configured
+    toolsets.
     """
     return resolve_runtime_mode(
-        platform=platform, cwd=cwd, config=config
+        platform=platform, cwd=cwd, config=config, profile=profile
     ).toolset_selection(config)
 
 
@@ -650,13 +680,14 @@ def coding_system_blocks(
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> list[str]:
     """Stable system-prompt blocks for the current posture (empty when general).
 
     ``model`` steers the brief's edit-format nudge toward the model's family.
     """
     return resolve_runtime_mode(
-        platform=platform, cwd=cwd, config=config, model=model
+        platform=platform, cwd=cwd, config=config, model=model, profile=profile
     ).system_blocks()
 
 
@@ -666,10 +697,11 @@ def coding_system_prompt_parts(
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """Return coding prefix, workspace snapshot, and trailing guidance."""
     return resolve_runtime_mode(
-        platform=platform, cwd=cwd, config=config, model=model
+        platform=platform, cwd=cwd, config=config, model=model, profile=profile
     ).system_prompt_parts()
 
 
@@ -678,17 +710,17 @@ def coding_compact_skill_categories(
     platform: Optional[str] = None,
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
+    profile: Optional[str] = None,
 ) -> frozenset[str]:
     """Skill categories the active posture demotes to names-only in the index.
 
-    Empty outside the coding posture and outside the opt-in ``focus`` mode —
-    the default posture never touches the skill index. Under ``focus``,
-    demoted — never hidden: every skill name stays in the index and remains
-    loadable via ``skill_view`` / ``skills_list``; only descriptions are
-    dropped.
+    Empty outside ``focus`` / a pinned profile — the default unpinned posture
+    never touches the skill index. Under ``focus`` or a pin, demoted — never
+    hidden: every skill name stays in the index and remains loadable via
+    ``skill_view`` / ``skills_list``; only descriptions are dropped.
     """
     return resolve_runtime_mode(
-        platform=platform, cwd=cwd, config=config
+        platform=platform, cwd=cwd, config=config, profile=profile
     ).compact_skill_categories()
 
 
@@ -914,3 +946,12 @@ def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
 
     lines.extend(_project_facts(root))
     return "\n".join(lines)
+
+
+# Register Burooj mode profiles (agent/sanad/build/design) after the seam is
+# defined. Import is deferred so coding_context stays loadable without the
+# Burooj module in non-fork installs; failure is non-fatal.
+try:
+    import agent.burooj_profiles  # noqa: F401
+except ImportError:
+    pass

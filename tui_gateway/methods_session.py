@@ -42,6 +42,12 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
 
+    # Burooj product mode (agent/sanad/build/design). Carried per-session into
+    # resolve_runtime_mode(profile=...) so the mode selector changes posture.
+    # Distinct from Hermes home ``profile`` above.
+    raw_mode = str(params.get("context_profile") or params.get("burooj_mode") or "").strip().lower()
+    context_profile = raw_mode if raw_mode in {"agent", "sanad", "build", "design"} else None
+
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
     # the agent below) — never a global config write, so picking a model/effort
@@ -83,6 +89,7 @@ def _(rid, params: dict) -> dict:
             "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
             "active_session_lease": lease,
             "cols": cols,
+            "context_profile": context_profile,
             "created_at": now,
             "edit_snapshots": {},
             "explicit_cwd": explicit_cwd,
@@ -154,6 +161,7 @@ def _(rid, params: dict) -> dict:
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _response_profile_name(profile),
+                **({"context_profile": context_profile} if context_profile else {}),
             },
         },
     )
@@ -2611,6 +2619,7 @@ def _(rid, params: dict) -> dict:
                     session_id=new_key,
                     session_db=branch_db,
                     platform_override=source,
+                    context_profile=session.get("context_profile") or None,
                 )
             finally:
                 _clear_session_context(tokens)

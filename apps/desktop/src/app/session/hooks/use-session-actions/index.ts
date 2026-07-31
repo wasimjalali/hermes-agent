@@ -13,6 +13,7 @@ import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
+import { $buroojMode } from '@/store/burooj-mode'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   beginSessionMutation,
@@ -172,9 +173,13 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
   const profile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
   await ensureGatewayProfile(profile)
 
+  // Burooj mode (agent/sanad/build/design) pins the runtime ContextProfile.
+  const buroojMode = $buroojMode.get()
+
   return {
     cols: 96,
     source: 'desktop',
+    context_profile: buroojMode,
     ...(cwd && { cwd }),
     ...(profile ? { profile } : {}),
     ...(selection.model
