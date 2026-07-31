@@ -61,7 +61,10 @@ interface SearchResponse {
     merged_candidate_count?: number
     permission_removed_count?: number
     final_chunk_ids?: string[]
-    permission_removals?: { chunk_id: string; reason: string }[]
+    // Reason to count. Sanad no longer returns per-chunk removal detail: a
+    // chunk_id encodes the document id and section heading of a chunk this
+    // principal is not allowed to see.
+    permission_removals?: Record<string, number>
     latency_ms?: number
     principal?: { user_id: string }
   }
@@ -136,7 +139,15 @@ export function SanadModePage() {
       setHealth(
         `${h.chunk_count ?? 0} chunks · ${h.embedding?.provider ?? '?'} · ${h.embedding?.model ?? '?'}`
       )
-      const c = (await sanadFetch('/v1/corpus')) as { documents?: CorpusDoc[] }
+      // Corpus is ACL filtered, so it needs the same principal as search. The
+      // document list reflects what this principal is allowed to see.
+      const principal = PRINCIPALS[principalKey]
+      const query = new URLSearchParams({
+        user_id: principal.user_id,
+        roles: principal.roles.join(','),
+        departments: principal.departments.join(',')
+      })
+      const c = (await sanadFetch(`/v1/corpus?${query}`)) as { documents?: CorpusDoc[] }
       setCorpus(c.documents || [])
       setError(null)
     } catch (e) {
@@ -147,7 +158,7 @@ export function SanadModePage() {
           : String(e)
       )
     }
-  }, [])
+  }, [principalKey])
 
   useEffect(() => {
     void refreshMeta()
@@ -421,13 +432,13 @@ export function SanadModePage() {
             Removals
           </h3>
           <ul className="mb-3 space-y-1">
-            {(trace?.permission_removals?.length ?? 0) > 0 ? (
-              trace!.permission_removals!.map(r => (
+            {Object.keys(trace?.permission_removals ?? {}).length > 0 ? (
+              Object.entries(trace!.permission_removals!).map(([reason, count]) => (
                 <li
                   className="rounded border border-(--ui-stroke-tertiary) px-2 py-1 font-mono text-[0.625rem] text-(--ui-text-tertiary)"
-                  key={r.chunk_id}
+                  key={reason}
                 >
-                  {r.chunk_id} · {r.reason}
+                  {count} · {reason}
                 </li>
               ))
             ) : (
