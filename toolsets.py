@@ -401,6 +401,10 @@ TOOLSETS = {
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
             "sanad_search", "sanad_get_chunk",
+            # Burooj Build harness (B2). repo_map orients, verify gates,
+            # preview proves it renders. Without these three registered the
+            # Build guidance references tools the model cannot call.
+            "repo_map", "verify", "preview",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
@@ -427,6 +431,10 @@ TOOLSETS = {
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze", "image_generate",
             "sanad_search", "sanad_get_chunk",
+            # Burooj design gate (B3). Four deterministic checks; they also run
+            # as rung 7 of the Build ladder, but Design owns the rules and must
+            # be able to call each one directly.
+            "design_lint", "contrast_check", "a11y_check", "visual_diff",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",

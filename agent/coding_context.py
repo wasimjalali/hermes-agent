@@ -634,8 +634,23 @@ def resolve_runtime_mode(
         name = _detect_profile_name(
             mode, (platform or "").strip().lower(), str(resolved_cwd)
         )
+
+    resolved_profile = get_profile(name)
+
+    # Burooj Agent mode resolves to the detected posture (above), which means
+    # its own brief would never reach the prompt. Merge it into a copy here so
+    # Agent keeps the coding posture AND carries its brief. The registry is
+    # untouched: every non-Burooj caller still gets the stock profile.
+    if requested == "agent":
+        try:
+            from agent.burooj_profiles import with_agent_brief
+
+            resolved_profile = with_agent_brief(resolved_profile)
+        except ImportError:
+            pass  # non-fork install, no Burooj profiles
+
     return RuntimeMode(
-        profile=get_profile(name),
+        profile=resolved_profile,
         surface=platform or "",
         cwd=resolved_cwd,
         config_mode=mode,

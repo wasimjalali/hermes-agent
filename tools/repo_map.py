@@ -11,13 +11,27 @@ Tool schema:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.build_workspace import resolve_workspace
+from tools.registry import registry
+
 logger = logging.getLogger("hermes.repo_map")
+
+
+def _safe_size(path: Path) -> int:
+    """File size in bytes, 0 when unreadable."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 # Approximate tokens per character (conservative estimate for code).
 _CHARS_PER_TOKEN = 3.5
@@ -81,20 +95,48 @@ _REF_TYPES: dict[str, set[str]] = {
 }
 
 
-def _get_parser(language: str) -> Any:
-    """Get a tree-sitter parser for the given language.
+class TreeSitterUnavailable(RuntimeError):
+    """Raised when tree-sitter is missing. repo_map cannot do its job without it."""
 
-    Returns None if tree-sitter or the language pack is not available.
+
+_PARSER_CACHE: dict[str, Any] = {}
+
+
+def tree_sitter_available() -> bool:
+    """Whether the tree-sitter language pack can be imported."""
+    try:
+        import tree_sitter_language_pack  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _get_parser(language: str) -> Any:
+    """Get a tree-sitter parser for the given language, cached per process.
+
+    Raises :class:`TreeSitterUnavailable` when the language pack is missing.
+    Returning None here (the original behaviour) made every file unparseable,
+    which turned repo_map into an alphabetical filename listing that still
+    reported success. A code map that silently contains no code is worse than
+    an error, because the model treats it as ground truth.
     """
+    if language in _PARSER_CACHE:
+        return _PARSER_CACHE[language]
+
     try:
         import tree_sitter_language_pack as tslp
-    except ImportError:
-        return None
+    except ImportError as exc:
+        raise TreeSitterUnavailable(
+            "repo_map needs tree-sitter. Install it with: "
+            "pip install tree-sitter tree-sitter-language-pack"
+        ) from exc
 
     try:
-        return tslp.get_parser(language)
+        parser = tslp.get_parser(language)
     except Exception:
-        return None
+        parser = None  # unsupported language, degrade to a filename entry
+    _PARSER_CACHE[language] = parser
+    return parser
 
 
 def _extract_name(node: Any) -> Optional[str]:
@@ -111,16 +153,49 @@ def _extract_name(node: Any) -> Optional[str]:
     return None
 
 
-def _extract_signature(node: Any, source_bytes: bytes, max_lines: int = 3) -> str:
-    """Extract a short signature from a definition node."""
+def _extract_signature(node: Any, lines: list[str], max_lines: int = 2) -> str:
+    """Extract a declaration signature from a definition node.
+
+    Takes pre-split *lines* rather than the source bytes: decoding and
+    splitting the whole file once per definition made this O(defs x filesize),
+    which was most of the runtime on large files.
+
+    Emits the declaration, not the first N lines of the body. The point of the
+    map is which symbols exist and what they take, so spending the token budget
+    on implementation lines is exactly backwards.
+    """
     start = node.start_point[0]
-    end = min(node.start_point[0] + max_lines, node.end_point[0] + 1)
-    lines = source_bytes.decode("utf-8", errors="replace").splitlines()
-    sig_lines = lines[start:end]
-    sig = "\n".join(sig_lines)
-    if end < node.end_point[0] + 1:
-        sig += "\n    ..."
-    return sig
+    if start >= len(lines):
+        return ""
+
+    # Collect lines until the parameter list closes, so a signature split
+    # across lines stays intact.
+    text = lines[start].rstrip()
+    for offset in range(1, max_lines + 1):
+        if text.count("(") <= text.count(")"):
+            break
+        if start + offset >= len(lines):
+            break
+        text = f"{text} {lines[start + offset].strip()}"
+
+    # Cut the body at the brace that opens it: the first '{' appearing outside
+    # the parameter list. A '{' inside the parameters (a destructured argument,
+    # an inline object type) must not be mistaken for the body, which is what
+    # made `function Button({ label }: { label: string })` come out mangled.
+    depth = 0
+    for i, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "{" and depth <= 0:
+            text = text[:i]
+            break
+
+    text = text.rstrip()
+    if text.endswith("=>"):
+        text = text[:-2].rstrip()
+    return text if len(text) <= 200 else text[:197] + "..."
 
 
 def _extract_import_source(node: Any) -> Optional[str]:
@@ -138,8 +213,69 @@ def _extract_import_source(node: Any) -> Optional[str]:
     return None
 
 
+_TS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+
+
+def _strip_json_comments(text: str) -> str:
+    """Remove // and /* */ comments so tsconfig.json parses as JSON.
+
+    tsconfig is JSONC. Next.js ships one with comments in it.
+    """
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^\s*//.*$", "", text)
+    return re.sub(r",(\s*[}\]])", r"\1", text)
+
+
+def _load_path_aliases(workspace: Path) -> dict[str, list[str]]:
+    """Read compilerOptions.paths from tsconfig/jsconfig.
+
+    Without this the graph had no edges at all on the project's own pinned
+    stack: every Next.js import looks like ``@/components/button``, none of
+    which is relative, so nothing resolved and PageRank ranked every file
+    identically.
+    """
+    for name in ("tsconfig.json", "jsconfig.json"):
+        config_path = workspace / name
+        if not config_path.is_file():
+            continue
+        try:
+            data = json.loads(_strip_json_comments(config_path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.debug("Could not parse %s: %s", config_path, exc)
+            continue
+        options = data.get("compilerOptions") or {}
+        paths = options.get("paths") or {}
+        base_url = options.get("baseUrl") or "."
+        if not isinstance(paths, dict):
+            continue
+        resolved: dict[str, list[str]] = {}
+        for pattern, targets in paths.items():
+            if isinstance(targets, list):
+                resolved[pattern] = [
+                    str(Path(base_url) / t) for t in targets if isinstance(t, str)
+                ]
+        if resolved:
+            return resolved
+    return {}
+
+
+def _candidate_files(base: Path, ext: str) -> list[Path]:
+    """Every file path an import specifier could mean."""
+    # Append the extension rather than replacing it: with_suffix turned
+    # './auth.service' into 'auth.ts' by treating '.service' as the suffix.
+    tries = [base]
+    tries += [base.with_name(base.name + e) for e in (ext, *_TS_EXTENSIONS, ".py")]
+    tries += [base / f"index{e}" for e in (ext, *_TS_EXTENSIONS)]
+    tries += [base / "__init__.py"]
+    return tries
+
+
 def _resolve_import_to_file(
-    import_source: str, from_file: Path, workspace: Path, ext: str
+    import_source: str,
+    from_file: Path,
+    workspace: Path,
+    ext: str,
+    aliases: Optional[dict[str, list[str]]] = None,
 ) -> Optional[Path]:
     """Attempt to resolve an import source string to a file in the workspace."""
     if not import_source:
@@ -147,23 +283,28 @@ def _resolve_import_to_file(
 
     # Relative imports (./foo, ../bar)
     if import_source.startswith("."):
-        base = from_file.parent
-        # Try with various extensions
-        for try_ext in (ext, ".ts", ".tsx", ".js", ".jsx", ".py"):
-            candidate = (base / import_source).with_suffix(try_ext)
-            if candidate.exists():
+        for candidate in _candidate_files(from_file.parent / import_source, ext):
+            if candidate.is_file():
                 return candidate.resolve()
-            # Try index file
-            index = base / import_source / f"index{try_ext}"
-            if index.exists():
-                return index.resolve()
         return None
+
+    # TypeScript path aliases (@/components/button, ~/lib/utils, ...)
+    for pattern, targets in (aliases or {}).items():
+        prefix = pattern.rstrip("*")
+        if not import_source.startswith(prefix):
+            continue
+        remainder = import_source[len(prefix):]
+        for target in targets:
+            base = workspace / target.rstrip("*").rstrip("/") / remainder
+            for candidate in _candidate_files(base, ext):
+                if candidate.is_file():
+                    return candidate.resolve()
 
     # Python dotted imports
     if ext == ".py":
         parts = import_source.replace(".", "/")
         for try_path in (workspace / f"{parts}.py", workspace / parts / "__init__.py"):
-            if try_path.exists():
+            if try_path.is_file():
                 return try_path.resolve()
 
     return None
@@ -226,6 +367,28 @@ def _pagerank_single_iter(
     return new_rank
 
 
+def _workspace_fingerprint(source_files: list[tuple[Path, str]]) -> str:
+    """Cheap digest of the file set and their mtimes.
+
+    Parsing a large repo costs seconds. Build mode calls repo_map repeatedly
+    across a session and the tree usually has not moved, so a fingerprint made
+    of (path, mtime_ns, size) turns every repeat call into a dict lookup, and
+    any real edit invalidates it.
+    """
+    hasher = hashlib.blake2b(digest_size=16)
+    for path, _language in source_files:
+        try:
+            st = path.stat()
+            hasher.update(f"{path}:{st.st_mtime_ns}:{st.st_size}".encode())
+        except OSError:
+            hasher.update(f"{path}:missing".encode())
+    return hasher.hexdigest()
+
+
+# workspace -> (fingerprint, parsed result without budget applied)
+_MAP_CACHE: dict[str, tuple[str, dict[str, Any]]] = {}
+
+
 def repo_map(workspace: Path, budget: int = 4096) -> dict[str, Any]:
     """Generate a token-budgeted repository map.
 
@@ -243,10 +406,33 @@ def repo_map(workspace: Path, budget: int = 4096) -> dict[str, Any]:
         files : int - total source files found
         languages : list[str] - languages detected
     """
+    if not tree_sitter_available():
+        raise TreeSitterUnavailable(
+            "repo_map needs tree-sitter. Install it with: "
+            "pip install tree-sitter tree-sitter-language-pack"
+        )
+
+    # Resolve up front. Import targets are resolved to absolute paths, so a
+    # relative workspace made every relative_to() call raise and silently
+    # dropped every edge in the graph.
+    workspace = Path(workspace).expanduser().resolve()
+
     source_files = _walk_source_files(workspace)
     if not source_files:
         return {"map": "(empty workspace - no source files found)", "files": 0, "languages": []}
 
+    # Parse the biggest files first when the cap bites: file order from
+    # os.walk is filesystem-arbitrary, so the 500-file limit was truncating by
+    # accident rather than by importance.
+    source_files.sort(key=lambda pair: -_safe_size(pair[0]))
+
+    cache_key = str(workspace.resolve())
+    fingerprint = _workspace_fingerprint(source_files)
+    cached = _MAP_CACHE.get(cache_key)
+    if cached is not None and cached[0] == fingerprint:
+        return _render_map(cached[1], budget)
+
+    aliases = _load_path_aliases(workspace)
     languages_found: set[str] = set()
     # file_path_str -> list of (name, signature)
     file_defs: dict[str, list[tuple[str, str]]] = {}
@@ -296,51 +482,44 @@ def repo_map(workspace: Path, budget: int = 4096) -> dict[str, Any]:
         defs: list[tuple[str, str]] = []
         def_types = _DEF_TYPES.get(language, set())
         ref_types = _REF_TYPES.get(language, set())
+        source_lines = source_bytes.decode("utf-8", errors="replace").splitlines()
 
-        # Walk the tree (iterative to avoid deep recursion).
-        visited = set()
-
-        def _walk(node: Any) -> None:
-            node_id = id(node)
-            if node_id in visited:
-                return
-            visited.add(node_id)
+        # Iterative walk. The original was recursive despite a comment saying
+        # otherwise, so a minified or generated file raised an uncaught
+        # RecursionError. It also deduplicated on id(node), which is unsound:
+        # py-tree-sitter materializes fresh node objects on each .children
+        # access, so a freed node's id could be reused and silently skip a live
+        # subtree. A tree needs no visited set at all.
+        stack: list[Any] = [tree.root_node]
+        while stack:
+            node = stack.pop()
 
             if node.type in def_types:
-                # Skip export_statement if its child is also a def type
-                # (to avoid duplicates).
-                if node.type == "export_statement":
-                    has_inner_def = any(
-                        c.type in def_types and c.type != "export_statement"
-                        for c in node.children
-                    )
-                    if not has_inner_def:
-                        name = _extract_name(node)
-                        sig = _extract_signature(node, source_bytes)
-                        if name:
-                            defs.append((name, sig))
-                else:
+                # An export_statement wrapping a real declaration would
+                # otherwise be reported twice.
+                is_redundant_export = node.type == "export_statement" and any(
+                    c.type in def_types and c.type != "export_statement"
+                    for c in node.children
+                )
+                if not is_redundant_export:
                     name = _extract_name(node)
-                    sig = _extract_signature(node, source_bytes)
                     if name:
-                        defs.append((name, sig))
+                        defs.append((name, _extract_signature(node, source_lines)))
 
             if node.type in ref_types:
                 import_src = _extract_import_source(node)
                 if import_src:
-                    ext = file_path.suffix
-                    target = _resolve_import_to_file(import_src, file_path, workspace, ext)
+                    target = _resolve_import_to_file(
+                        import_src, file_path, workspace, file_path.suffix, aliases
+                    )
                     if target is not None:
                         try:
-                            target_rel = str(target.relative_to(workspace))
-                            graph[rel_path].add(target_rel)
+                            graph[rel_path].add(str(target.relative_to(workspace)))
                         except ValueError:
                             pass
 
-            for child in node.children:
-                _walk(child)
+            stack.extend(node.children)
 
-        _walk(tree.root_node)
         file_defs[rel_path] = defs
         if rel_path not in graph:
             graph[rel_path] = set()
@@ -352,35 +531,108 @@ def repo_map(workspace: Path, budget: int = 4096) -> dict[str, Any]:
     all_files = list(file_defs.keys())
     all_files.sort(key=lambda f: (-ranks.get(f, 0.0), f))
 
-    # Greedily fill the budget.
+    parsed = {
+        "ranked_files": all_files,
+        "file_defs": file_defs,
+        "files": len(source_files),
+        "parsed": min(len(source_files), parse_limit),
+        "languages": sorted(languages_found),
+        "edges": sum(len(v) for v in graph.values()),
+    }
+    _MAP_CACHE[cache_key] = (fingerprint, parsed)
+    return _render_map(parsed, budget)
+
+
+def _render_map(parsed: dict[str, Any], budget: int) -> dict[str, Any]:
+    """Format a parsed workspace into a budgeted map string.
+
+    Separate from parsing so a cached parse can serve any budget.
+    """
     max_chars = int(budget * _CHARS_PER_TOKEN)
+    file_defs: dict[str, list[tuple[str, str]]] = parsed["file_defs"]
     output_parts: list[str] = []
     chars_used = 0
+    omitted = 0
 
-    for rel_path in all_files:
-        defs = file_defs[rel_path]
-        if defs:
-            section = f"## {rel_path}\n"
-            for name, sig in defs:
+    for rel_path in parsed["ranked_files"]:
+        section = f"## {rel_path}\n"
+        for _name, sig in file_defs.get(rel_path, []):
+            if sig:
                 section += f"  {sig}\n"
-        else:
-            section = f"## {rel_path}\n"
 
         section_len = len(section)
         if chars_used + section_len > max_chars:
-            # If we haven't added anything yet, add at least the filename.
-            if not output_parts:
-                output_parts.append(f"## {rel_path}\n  (truncated)\n")
-            break
+            # Keep filling with cheaper entries rather than stopping dead: a
+            # single large file used to truncate the whole rest of the map.
+            bare = f"## {rel_path}\n"
+            if chars_used + len(bare) <= max_chars:
+                output_parts.append(bare)
+                chars_used += len(bare)
+            else:
+                omitted += 1
+            continue
         output_parts.append(section)
         chars_used += section_len
 
     map_str = "".join(output_parts).rstrip()
+    if omitted:
+        map_str += f"\n\n({omitted} more file(s) omitted for budget)"
     if not map_str:
         map_str = "(no definitions extracted)"
 
     return {
         "map": map_str,
-        "files": len(source_files),
-        "languages": sorted(languages_found),
+        "files": parsed["files"],
+        "parsed": parsed["parsed"],
+        "languages": parsed["languages"],
+        "edges": parsed["edges"],
     }
+
+
+# ── Tool registration ───────────────────────────────────────────────────────
+
+REPO_MAP_SCHEMA = {
+    "name": "repo_map",
+    "description": (
+        "Produce a ranked, token-budgeted map of the workspace: which files "
+        "exist, what they define, and which ones matter most (ranked by how "
+        "much the rest of the codebase imports them). Deterministic, no "
+        "embeddings. Call this first when opening an unfamiliar codebase, "
+        "before reading individual files."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "budget": {
+                "type": "integer",
+                "description": "Approximate token budget for the map. Default 4096.",
+                "default": 4096,
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def handle_repo_map(args: dict[str, Any], **kwargs: Any) -> str:
+    """Model-facing entry point for repo_map."""
+    budget = args.get("budget", 4096)
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 256:
+        return json.dumps({"error": "'budget' must be an integer of at least 256."})
+    try:
+        result = repo_map(resolve_workspace(), budget=budget)
+    except TreeSitterUnavailable as exc:
+        return json.dumps({"error": str(exc)})
+    except Exception as exc:
+        logger.exception("repo_map failed")
+        return json.dumps({"error": f"repo_map crashed: {type(exc).__name__}: {exc}"})
+    return json.dumps(result, indent=2)
+
+
+registry.register(
+    name="repo_map",
+    toolset="burooj_build",
+    schema=REPO_MAP_SCHEMA,
+    handler=handle_repo_map,
+    emoji="🗺️",
+)

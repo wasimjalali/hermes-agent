@@ -72,22 +72,34 @@ Use this skill when Build mode needs to create a new application from scratch. T
 
 6. **Write burooj.build.json**
 
-   Copy the template from this skill's `templates/burooj.build.json` into the workspace root. Adjust if the project name differs.
+   Copy `templates/burooj.build.json` into the workspace root.
 
-7. **Install dependencies**
+   It deliberately has **no `test` section**. A fresh `create-next-app` has no `test` script, so declaring one makes `npm test` exit non-zero and the guard rung fail on a scaffold that is in fact fine. Switch to `templates/burooj.build.with-tests.json` the moment you add a real test runner.
+
+7. **Copy the design-lint exemptions**
+
+   Copy `templates/lint-ignore.json` to `burooj.design/lint-ignore.json`.
+
+   The stock `create-next-app` homepage ships `bg-[#383838]`, `gap-[32px]` and raw hex, so without this the design gate fails on an untouched scaffold. **Delete the `src/app/page.tsx` entry as soon as you replace that page with real content**, or the gate stops watching your actual homepage.
+
+8. **Install the check dependencies**
 
    ```bash
-   npm ci
+   npm ci && npm i -D axe-core
    ```
 
-8. **Run verify (rungs 1-5)**
+   `axe-core` powers the a11y rung. Without it that check skips rather than fails, so the gate would pass while checking less than you think.
+
+9. **Run verify**
 
    ```bash
    # From the agent, call:
-   verify(rungs=["typecheck", "lint", "guard", "build"])
+   verify()
    ```
 
-   All must pass on the fresh scaffold before writing any application code.
+   Run the whole ladder, not a subset. On a fresh scaffold expect: `install`, `typecheck`, `lint`, `build` and `render` to pass; `fix` and `guard` to **skip** (no test section yet); `design_gate` to pass.
+
+   A `skip` means the project declares no such step. An `error` means a check could not run, which is never a pass. Investigate any `error` before writing application code.
 
 ## After scaffolding
 
@@ -104,3 +116,6 @@ Use this skill when Build mode needs to create a new application from scratch. T
 - The scaffold creates `src/app/` (App Router). Do not mix in Pages Router.
 - Convex schema goes in `convex/schema.ts`. Do not put DB logic in API routes.
 - Do not install style-dictionary as a dependency. The compiler is self-contained.
+- Do not add a `test` section to the manifest before there is a test runner. An empty `guard` list means "run the whole suite", which fails when there is no suite.
+- Do not widen `lint-ignore.json` to silence a failure you have not read. It exists for the generated scaffold, not for your own code.
+- Do not run `visual_diff` with `update_baselines` to clear a red gate. Baselines are the record of what shipped; only update them for a change you intended.

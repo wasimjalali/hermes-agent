@@ -16,8 +16,10 @@ logger = logging.getLogger("hermes.build_manifest")
 
 MANIFEST_FILENAME = "burooj.build.json"
 
-# Required top-level string keys.
-_REQUIRED_STRING_KEYS = ("install", "typecheck", "lint", "build")
+# Command keys. All optional: a project with no lint step or no tests must
+# still be able to produce a valid manifest. A missing or empty command makes
+# its ladder rung report "skip" rather than failing the whole verification.
+_COMMAND_KEYS = ("install", "typecheck", "lint", "build")
 
 
 @dataclass(frozen=True)
@@ -40,14 +42,20 @@ class DevConfig:
 
 @dataclass(frozen=True)
 class BuildManifest:
-    """Parsed and validated burooj.build.json."""
+    """Parsed and validated burooj.build.json.
 
-    install: str
-    typecheck: str
-    lint: str
-    test: TestConfig
-    build: str
-    dev: DevConfig
+    Every command is optional. An empty string means "this project has no such
+    step", and the corresponding ladder rung reports ``skip``. ``dev`` is None
+    when the project declares no dev server, which makes the render, preview,
+    a11y and visual-diff paths skip rather than fail.
+    """
+
+    install: str = ""
+    typecheck: str = ""
+    lint: str = ""
+    test: Optional[TestConfig] = None
+    build: str = ""
+    dev: Optional[DevConfig] = None
     routes: list[str] = field(default_factory=lambda: ["/"])
 
 
@@ -55,20 +63,29 @@ class ManifestError(Exception):
     """Raised when a manifest is missing, malformed, or invalid."""
 
 
-def _validate_string(data: dict[str, Any], key: str) -> str:
-    """Validate that a key exists and is a non-empty string."""
-    value = data.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ManifestError(f"'{key}' must be a non-empty string")
+def _validate_optional_string(data: dict[str, Any], key: str) -> str:
+    """Return a trimmed command string, or "" when the key is absent.
+
+    A key present but not a string is still an error: that is a typo, not an
+    intentional omission, and silently treating it as "no such step" would let
+    a broken manifest report a green ladder.
+    """
+    if key not in data or data[key] is None:
+        return ""
+    value = data[key]
+    if not isinstance(value, str):
+        raise ManifestError(f"'{key}' must be a string when present")
     return value.strip()
 
 
-def _validate_test(data: dict[str, Any]) -> TestConfig:
-    """Validate and parse the 'test' section."""
+def _validate_test(data: dict[str, Any]) -> Optional[TestConfig]:
+    """Validate and parse the 'test' section. None when absent."""
     raw = data.get("test")
     if raw is None:
-        raise ManifestError("'test' section is required")
+        return None
     if isinstance(raw, str):
+        if not raw.strip():
+            return None
         return TestConfig(command=raw)
     if not isinstance(raw, dict):
         raise ManifestError("'test' must be a string or object")
@@ -84,11 +101,11 @@ def _validate_test(data: dict[str, Any]) -> TestConfig:
     return TestConfig(command=command.strip(), fix=fix, guard=guard)
 
 
-def _validate_dev(data: dict[str, Any]) -> DevConfig:
-    """Validate and parse the 'dev' section."""
+def _validate_dev(data: dict[str, Any]) -> Optional[DevConfig]:
+    """Validate and parse the 'dev' section. None when absent."""
     raw = data.get("dev")
     if raw is None:
-        raise ManifestError("'dev' section is required")
+        return None
     if not isinstance(raw, dict):
         raise ManifestError("'dev' must be an object")
     command = raw.get("command")
@@ -152,23 +169,29 @@ def load_manifest(workspace: Path) -> BuildManifest:
     if not isinstance(data, dict):
         raise ManifestError(f"{MANIFEST_FILENAME} must be a JSON object")
 
-    # Validate required string fields.
-    install = _validate_string(data, "install")
-    typecheck = _validate_string(data, "typecheck")
-    lint = _validate_string(data, "lint")
-    build = _validate_string(data, "build")
+    # Command fields. All optional; absent means the rung skips.
+    commands = {key: _validate_optional_string(data, key) for key in _COMMAND_KEYS}
 
-    # Validate structured sections.
+    # Structured sections, also optional.
     test = _validate_test(data)
     dev = _validate_dev(data)
     routes = _validate_routes(data)
 
-    return BuildManifest(
-        install=install,
-        typecheck=typecheck,
-        lint=lint,
+    manifest = BuildManifest(
+        install=commands["install"],
+        typecheck=commands["typecheck"],
+        lint=commands["lint"],
         test=test,
-        build=build,
+        build=commands["build"],
         dev=dev,
         routes=routes,
     )
+
+    if not any((manifest.install, manifest.typecheck, manifest.lint,
+                manifest.build, manifest.test, manifest.dev)):
+        raise ManifestError(
+            f"{MANIFEST_FILENAME} declares no commands at all. A manifest that "
+            f"verifies nothing would report a green ladder for any change."
+        )
+
+    return manifest

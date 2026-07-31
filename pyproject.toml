@@ -173,6 +173,20 @@ matrix = ["mautrix[encryption]==0.21.0", "aiosqlite==0.22.1", "asyncpg==0.31.0",
 # here to keep the dependency local to wecom_callback's threat model.
 wecom = ["defusedxml==0.7.1"]
 cli = ["simple-term-menu==1.6.6"]
+# Burooj Build mode (B2) — repo_map's tree-sitter parsing. Only loaded when a
+# session is in Build mode, so it stays out of core per the scope rule above.
+burooj-build = [
+  "tree-sitter==0.25.2",
+  "tree-sitter-language-pack==0.9.0",
+]
+# Burooj Build/Design browser checks (B2/B3) — preview, a11y_check and
+# visual_diff drive a real browser. Pillow is not required but makes
+# visual_diff's PNG decode roughly ten times faster; it falls back to a
+# pure-Python decoder when absent.
+burooj-browser = [
+  "playwright==1.58.0",
+  "pillow==12.1.0",
+]
 tts-premium = ["elevenlabs==1.59.0"]
 voice = [
   # Local STT pulls in wheel-only transitive deps (ctranslate2, onnxruntime).

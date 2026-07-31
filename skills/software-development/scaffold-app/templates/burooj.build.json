@@ -2,11 +2,6 @@
   "install": "npm ci",
   "typecheck": "npx tsc --noEmit",
   "lint": "npm run lint",
-  "test": {
-    "command": "npm test",
-    "fix": [],
-    "guard": []
-  },
   "build": "npm run build",
   "dev": {
     "command": "npm run dev",
