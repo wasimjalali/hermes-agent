@@ -10,6 +10,7 @@ import {
   Archive,
   BarChart3,
   Bell,
+  Bookmark,
   Download,
   Globe,
   Info,
@@ -41,6 +42,7 @@ import { KEYS_VIEWS, KeysSettings, type KeysView } from './keys-settings'
 import { NotificationsSettings } from './notifications-settings'
 import { PluginsSettings } from './plugins-settings'
 import { PROVIDER_VIEWS, ProvidersSettings, type ProviderView } from './providers-settings'
+import { SanadKnowledgeSettings } from './sanad-knowledge-settings'
 import { SessionsSettings } from './sessions-settings'
 import type { SettingsPageProps, SettingsView as SettingsViewId } from './types'
 
@@ -54,6 +56,7 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   'billing',
   'plugins',
   'sessions',
+  'sanad',
   'about'
 ]
 
@@ -251,6 +254,13 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         onSelect: () => setActiveView('sessions')
       },
       {
+        active: activeView === 'sanad',
+        icon: Bookmark,
+        id: 'sanad',
+        label: 'Sanad knowledge',
+        onSelect: () => setActiveView('sanad')
+      },
+      {
         active: activeView === 'about',
         gapBefore: true,
         icon: Info,
@@ -330,6 +340,8 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
             <BillingSettings />
           ) : activeView === 'plugins' ? (
             <PluginsSettings />
+          ) : activeView === 'sanad' ? (
+            <SanadKnowledgeSettings />
           ) : (
             <SessionsSettings />
           )}

@@ -275,6 +275,13 @@ _LONG_HANDLERS = frozenset(
         "shell.exec",
         "skills.manage",
         "slash.exec",
+        # Burooj Build/Design panels. verify and preview run real commands and
+        # browser boots (minutes on a cold build); design.checks boots the dev
+        # server and Playwright. Keep them off the reader thread so the panel
+        # cannot freeze prompt.submit / session.interrupt behind it.
+        "burooj.build.verify",
+        "burooj.build.preview",
+        "burooj.design.checks",
     }
 )
 
@@ -5918,6 +5925,29 @@ def _resolve_runtime_with_fallback(
         raise
 
 
+def _resolve_burooj_hint_model(context_profile: str | None) -> str:
+    """Model id a pinned Burooj profile's ``model_hint`` maps to, or "".
+
+    Reads ``burooj.model_hints.<hint>`` from config. Returns an empty string
+    when the profile is unknown, has no hint, or the hint is unmapped, so the
+    caller falls back to the default model selection. Never raises: mode
+    routing must not break session creation over a config typo.
+    """
+    if not context_profile:
+        return ""
+    try:
+        from agent.burooj_profiles import resolve_model_for_hint
+        from agent.coding_context import get_profile
+
+        profile = get_profile(context_profile)
+        hint = profile.model_hint
+        if not hint:
+            return ""
+        return resolve_model_for_hint(hint, _load_cfg())
+    except Exception:
+        return ""
+
+
 def _make_agent(
     sid: str,
     key: str,
@@ -6047,6 +6077,15 @@ def _make_agent(
             model = model_override
         if provider_override:
             requested_provider = provider_override
+        elif not (isinstance(model_override, str) and model_override):
+            # Burooj mode routing: a pinned profile's model_hint ("coding" for
+            # Build, "vision" for Design) maps to a configured model id under
+            # config `burooj.model_hints`. An explicit per-session model pick
+            # above always wins; a missing or unmapped hint falls back to the
+            # default model selection rather than erroring.
+            hinted = _resolve_burooj_hint_model(context_profile)
+            if hinted:
+                model = hinted
         resolution = _resolve_runtime_with_fallback({
             "requested": requested_provider,
             "target_model": model or None,
@@ -6109,6 +6148,38 @@ def _make_agent(
     if context_profile:
         setattr(agent, "context_profile", context_profile)
     return agent
+
+
+def _pin_build_workspace(agent, session: dict):
+    """Confine writes to the Build workspace for the duration of one turn.
+
+    Returns a token for :func:`_unpin_build_workspace`, or None when the
+    session is not in Build mode (every other mode is unaffected).
+    """
+    if getattr(agent, "context_profile", None) != "build":
+        return None
+    try:
+        from agent.build_workspace import resolve_workspace, set_active_workspace
+    except ImportError:
+        return None
+    try:
+        cwd = session.get("explicit_cwd") or session.get("cwd")
+        return set_active_workspace(resolve_workspace(cwd))
+    except Exception:
+        logger.warning("Could not pin Build workspace; writes stay unconfined", exc_info=True)
+        return None
+
+
+def _unpin_build_workspace(token) -> None:
+    """Release a :func:`_pin_build_workspace` pin."""
+    if token is None:
+        return
+    try:
+        from agent.build_workspace import reset_active_workspace
+
+        reset_active_workspace(token)
+    except ImportError:
+        pass
 
 
 def _init_session(
@@ -9162,7 +9233,14 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-            result = agent.run_conversation(run_message, **run_kwargs)
+            # Burooj Build mode confines file writes to its workspace. The pin
+            # is a ContextVar, so it must be set on the thread that actually
+            # runs the turn, not where the agent was constructed.
+            _ws_token = _pin_build_workspace(agent, session)
+            try:
+                result = agent.run_conversation(run_message, **run_kwargs)
+            finally:
+                _unpin_build_workspace(_ws_token)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -13247,6 +13325,7 @@ def _browser_disconnect(rid) -> dict:
 # Imported at the end of this module so every global the handlers close
 # over already exists; register() rebinds them onto this namespace.
 from . import (  # noqa: E402
+    methods_burooj as _methods_burooj,
     methods_complete as _methods_complete,
     methods_config as _methods_config,
     methods_prompt as _methods_prompt,
@@ -13255,6 +13334,7 @@ from . import (  # noqa: E402
 )
 
 for _m in (
+    _methods_burooj,
     _methods_session,
     _methods_prompt,
     _methods_config,

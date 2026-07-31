@@ -2,10 +2,9 @@
 
 A thin abstraction (exec, read, write, ports, snapshot) that wraps the local
 backend. A container or cloud backend can drop in later by implementing the
-same protocol. For now only the local implementation exists.
-
-The architecture spec (section 4.7) requires this seam to exist so that Build
-tools never shell out directly but go through a backend that can be swapped.
+same protocol. The architecture spec (section 4.7) requires this seam to
+exist so that Build tools never shell out directly but go through a backend
+that can be swapped. Today: :class:`LocalRuntime` and :class:`DockerRuntime`.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,8 +74,61 @@ class ProcessHandle:
             return self.stderr_lines[since:]
 
 
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """SIGTERM then SIGKILL a process and everything it spawned.
+
+    Both calls target the process group, which only exists because the process
+    was started with ``start_new_session=True`` / ``os.setsid``. Killing the
+    leader alone leaves the real worker (webpack, tsc, vitest) running.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (OSError, ProcessLookupError):
+        pgid = None
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        delivered = False
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                delivered = True
+            except (OSError, ProcessLookupError):
+                return
+            except Exception:
+                # Some environments forbid group signals (restricted
+                # sandboxes, and the test suite's live-system guard). Fall
+                # back to signalling the leader directly: it kills less, but
+                # killing nothing is worse.
+                pgid = None
+        if not delivered:
+            try:
+                proc.send_signal(sig)
+            except (OSError, ProcessLookupError, ValueError):
+                return
+            except Exception:
+                # Signal delivery refused by the environment. Nothing more we
+                # can do, and failing to clean up must not raise into the
+                # caller's exec() result.
+                return
+        try:
+            proc.wait(timeout=3)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 class Runtime(ABC):
     """Abstract runtime backend for Build mode.
+
+    **On ``shell=True``.** Manifest commands are shell strings by design
+    (``npm run build``, ``npx tsc --noEmit``), so the local backend runs them
+    through a shell and cannot switch to argv lists without changing the
+    manifest format. The command source, not the invocation, is therefore the
+    control that matters: ``agent/build_workspace.py`` bounds which
+    ``burooj.build.json`` can be picked up, and ``verify`` surfaces the
+    resolved workspace and the exact commands before the first run of a
+    session. Never pass model-authored or user-message text through ``exec``;
+    it takes manifest commands only.
 
     Every Build tool operation goes through this interface. The local
     implementation shells out directly. A future container backend would
@@ -150,28 +203,48 @@ class LocalRuntime(Runtime):
         if env:
             run_env.update(env)
 
+        # ``subprocess.run(shell=True, timeout=...)`` kills only the shell on
+        # timeout, orphaning the process that actually does the work (a webpack
+        # build, a test runner) still holding the workspace. Run the shell in
+        # its own process group and kill the whole group instead.
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=str(cwd),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 env=run_env,
+                start_new_session=True,
             )
+        except OSError as exc:
+            return ExecResult(exit_code=1, stderr=f"Failed to run: {exc}")
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
             return ExecResult(
-                exit_code=result.returncode,
-                stdout=result.stdout,
-                stderr=result.stderr,
+                exit_code=proc.returncode,
+                stdout=stdout or "",
+                stderr=stderr or "",
             )
         except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            # Drain whatever was produced before the kill; it usually explains
+            # why the command hung.
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except (subprocess.TimeoutExpired, ValueError, OSError):
+                stdout, stderr = "", ""
+            message = f"Command timed out after {timeout}s: {command}"
             return ExecResult(
                 exit_code=1,
-                stderr=f"Command timed out after {timeout}s: {command}",
+                stdout=stdout or "",
+                stderr=(f"{stderr}\n{message}" if stderr else message),
                 timed_out=True,
             )
         except OSError as exc:
+            _kill_process_group(proc)
             return ExecResult(exit_code=1, stderr=f"Failed to run: {exc}")
 
     def start_process(
@@ -231,17 +304,11 @@ class LocalRuntime(Runtime):
         proc = handle._process
         if proc is None:
             return
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            pass
+        _kill_process_group(proc)
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
+            pass
         handle._process = None
 
     def read(self, path: Path) -> bytes:
@@ -284,11 +351,33 @@ class LocalRuntime(Runtime):
         return False
 
     def snapshot(self, workspace: Path) -> str:
-        """Delegate to Hermes checkpoint_manager if available, else no-op."""
-        # The checkpoint system is already wired at a higher level.
-        # This method exists for the interface contract. A container runtime
-        # would take a filesystem snapshot here.
-        return f"local:{int(time.time())}"
+        """Delegate to Hermes checkpoint_manager.
+
+        Hermes already snapshots before every mutating turn, so the local
+        backend forwards to that rather than duplicating it. When the
+        checkpoint system is unavailable this raises instead of returning a
+        fabricated id: a caller that believes it has a restore point when it
+        does not is worse off than one that knows it has none.
+        """
+        try:
+            from tools.checkpoint_manager import CheckpointManager
+        except ImportError as exc:
+            raise NotImplementedError(
+                "LocalRuntime.snapshot requires tools.checkpoint_manager. "
+                "Hermes checkpointing already covers mutating turns, so prefer "
+                "the agent's own manager over the Runtime seam."
+            ) from exc
+
+        manager = CheckpointManager(enabled=True)
+        manager.new_turn()
+        # ensure_checkpoint returns a bool and never raises; a False means the
+        # snapshot did not happen, which the caller must not mistake for one.
+        if not manager.ensure_checkpoint(str(workspace), reason="build_runtime.snapshot"):
+            raise RuntimeError(
+                f"Checkpoint failed for {workspace}. Not returning a snapshot id "
+                f"for a snapshot that was not taken."
+            )
+        return f"checkpoint:{workspace}:{int(time.time())}"
 
 
 # Module-level singleton. Tools import this.
@@ -307,3 +396,381 @@ def set_runtime(runtime: Runtime) -> None:
     """Swap the runtime backend (for testing or container mode)."""
     global _runtime
     _runtime = runtime
+
+
+# ── Container backend ───────────────────────────────────────────────────────
+
+
+class DockerUnavailable(RuntimeError):
+    """Raised when the docker CLI cannot reach a daemon."""
+
+
+@dataclass
+class ContainerProcessHandle(ProcessHandle):
+    """ProcessHandle for a named container.
+
+    Liveness comes from ``docker inspect`` rather than a Popen, and the
+    container id is the handle's identity.
+    """
+
+    container_id: str = ""
+    _runtime: Any = field(default=None, repr=False)
+
+    @property
+    def is_running(self) -> bool:
+        if not self.container_id:
+            return False
+        check = getattr(self._runtime, "_container_running", None)
+        if check is None:
+            return False
+        return check(self.container_id)
+
+
+class DockerRuntime(Runtime):
+    """Container execution backend via the docker CLI (arm's-length API).
+
+    Runs every Build operation inside a container built from a Node image.
+    The workspace is bind-mounted at its own absolute path, so manifest
+    commands, relative paths and read/write paths behave exactly as they do
+    on the local backend: no tool file needs to know a container is involved.
+
+    **Port model.** The dev server's port travels through the environment as
+    ``PORT`` (the BuildSession sets it from the manifest). The container
+    publishes ``127.0.0.1:<PORT>:<PORT>`` so ``port_status`` and
+    ``wait_for_port`` on the host observe the same port the manifest names.
+    When ``PORT`` is absent no port is published and the server is only
+    reachable inside the container.
+
+    **Deliberately not a wrapper library.** This shells out to the ``docker``
+    CLI. Daytona (AGPL-3.0) and WebContainers (commercial license) are
+    excluded by the architecture spec; a CLI is the arm's-length API.
+
+    Parameters
+    ----------
+    image : str, optional
+        Container image for Build work. Defaults to the ``BUROOJ_RUNTIME_IMAGE``
+        env var or ``node:22-bookworm-slim`` (Node 22 + npm, the pinned stack's
+        runtime). Must contain a POSIX shell and whatever the manifest commands
+        need.
+    docker_cmd : str, optional
+        Path to the docker CLI. Defaults to ``docker``.
+    """
+
+    def __init__(
+        self,
+        image: Optional[str] = None,
+        docker_cmd: str = "docker",
+    ) -> None:
+        self.image = image or os.environ.get(
+            "BUROOJ_RUNTIME_IMAGE", "node:22-bookworm-slim"
+        )
+        self.docker_cmd = docker_cmd
+        self._available: Optional[bool] = None
+        self._availability_lock = threading.Lock()
+
+    # ── docker plumbing ────────────────────────────────────────────────────
+
+    def _ensure_available(self) -> None:
+        """Verify the docker CLI exists and a daemon answers. Fail loud."""
+        if self._available:
+            return
+        with self._availability_lock:
+            if self._available:
+                return
+            try:
+                proc = subprocess.run(
+                    [self.docker_cmd, "version", "--format", "{{.Server.Version}}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise DockerUnavailable(
+                    f"docker CLI unavailable ({exc}). Install Docker and start "
+                    f"the daemon to use the container Build backend."
+                ) from exc
+            if proc.returncode != 0 or not proc.stdout.strip():
+                raise DockerUnavailable(
+                    f"docker daemon not reachable: {proc.stderr.strip() or proc.stdout.strip()}"
+                )
+            self._available = True
+
+    def _run_docker(
+        self,
+        args: list[str],
+        timeout: int = 120,
+    ) -> subprocess.CompletedProcess:
+        self._ensure_available()
+        try:
+            return subprocess.run(
+                [self.docker_cmd, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DockerUnavailable(
+                f"docker {args[0]} timed out after {timeout}s: "
+                f"{exc.stderr or exc.stdout or ''}"
+            ) from exc
+
+    def _run_args(
+        self,
+        cwd: Path,
+        env: Optional[dict[str, str]],
+    ) -> list[str]:
+        """Shared ``docker run`` flags: mount the workspace, publish PORT.
+
+        Returns the flags after ``docker run``; callers prepend ``run`` and
+        any name/label flags they need.
+        """
+        args = [
+            "--rm", "--init",
+            "-v", f"{cwd}:{cwd}",
+            "-w", str(cwd),
+        ]
+        port = (env or {}).get("PORT")
+        if port:
+            try:
+                int(port)
+                args += ["-p", f"127.0.0.1:{port}:{port}"]
+            except ValueError:
+                pass  # malformed PORT: container-internal only, like no PORT
+        for key, value in (env or {}).items():
+            args += ["-e", f"{key}={value}"]
+        args += [self.image]
+        return args
+
+    # ── Runtime protocol ───────────────────────────────────────────────────
+
+    def exec(
+        self,
+        command: str,
+        cwd: Path,
+        timeout: int = 120,
+        env: Optional[dict[str, str]] = None,
+    ) -> ExecResult:
+        """Run *command* to completion inside a throwaway container."""
+        self._ensure_available()
+        name = self._container_label(cwd, command)
+        # A stale container from a timed-out run with the same command must
+        # not fail the next run with "name already in use". The rm is
+        # best-effort: availability was already proven above.
+        try:
+            self._run_docker(["rm", "-f", name], timeout=30)
+        except (DockerUnavailable, OSError):
+            pass
+        args = ["run", "--name", name]
+        args += self._run_args(cwd, env)
+        args += ["sh", "-lc", command]
+        try:
+            proc = subprocess.run(
+                [self.docker_cmd, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return ExecResult(
+                exit_code=proc.returncode,
+                stdout=proc.stdout or "",
+                stderr=proc.stderr or "",
+            )
+        except subprocess.TimeoutExpired as exc:
+            # ``docker run --rm`` would orphan the container on CLI timeout.
+            # Kill the named container; --rm removes it afterwards.
+            self._kill_matching_containers(cwd, command)
+            return ExecResult(
+                exit_code=1,
+                stdout=exc.stdout or "",
+                stderr=(exc.stderr or "") + f"\nCommand timed out after {timeout}s: {command}",
+                timed_out=True,
+            )
+
+    def _container_label(self, cwd: Path, command: str) -> str:
+        """Deterministic container label for one (workspace, command) pair."""
+        import hashlib
+
+        digest = hashlib.sha256(f"{cwd}\0{command}".encode()).hexdigest()[:12]
+        return f"burooj-{digest}"
+
+    def _kill_matching_containers(self, cwd: Path, command: str) -> None:
+        """Kill and remove any container running this exact command.
+
+        Used on exec timeout, where the CLI died but the container did not.
+        Matching on the label keeps cleanup surgical: only this workspace's
+        instance of this command is touched.
+        """
+        label = self._container_label(cwd, command)
+        try:
+            self._run_docker(["rm", "-f", label], timeout=30)
+        except (DockerUnavailable, OSError):
+            pass  # cleanup must not mask the timeout result
+
+    def start_process(
+        self,
+        command: str,
+        cwd: Path,
+        env: Optional[dict[str, str]] = None,
+    ) -> ProcessHandle:
+        """Start *command* as a named, long-running container.
+
+        The container gets a deterministic name per (workspace, command) so a
+        duplicate start replaces the previous one instead of leaking a second
+        server on the same published port.
+        """
+        self._ensure_available()
+        name = self._container_label(cwd, command)
+        args = ["run", "-d", "--rm", "--init", "--name", name]
+        args += self._run_args(cwd, env)
+        args += ["sh", "-lc", command]
+
+        # Remove a stale container with the same name first, so a restarted
+        # dev server does not fail with "name already in use".
+        try:
+            self._run_docker(["rm", "-f", name], timeout=30)
+        except (DockerUnavailable, OSError):
+            pass
+
+        proc = self._run_docker(args, timeout=120)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"docker run failed for '{command}': {proc.stderr.strip() or proc.stdout.strip()}"
+            )
+
+        handle = ContainerProcessHandle(
+            pid=0, command=command, _process=None, container_id=name, _runtime=self
+        )
+
+        # Follow the container's logs with docker logs -f.
+        def _log_reader(kind: str, target: list[str], lock: threading.Lock) -> None:
+            try:
+                log_proc = subprocess.Popen(
+                    [self.docker_cmd, "logs", "-f", "--tail", "0", name],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT if kind == "stdout" else subprocess.PIPE,
+                    text=True,
+                )
+                for line in iter(log_proc.stdout.readline, ""):
+                    with lock:
+                        target.append(line.rstrip("\n"))
+                log_proc.stdout.close()
+            except (ValueError, OSError, AttributeError):
+                pass
+
+        handle._stdout_thread = threading.Thread(
+            target=_log_reader,
+            args=("stdout", handle.stdout_lines, handle._lock),
+            daemon=True,
+        )
+        handle._stdout_thread.start()
+        handle._stderr_thread = threading.Thread(
+            target=_log_reader,
+            args=("stderr", handle.stderr_lines, handle._lock),
+            daemon=True,
+        )
+        handle._stderr_thread.start()
+        return handle
+
+    def _container_running(self, name: str) -> bool:
+        try:
+            proc = self._run_docker(
+                ["inspect", "--format", "{{.State.Running}}", name], timeout=30
+            )
+        except (DockerUnavailable, OSError):
+            return False
+        return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+    def stop_process(self, handle: ProcessHandle, timeout: int = 5) -> None:
+        name = getattr(handle, "container_id", None)
+        if not name:
+            return
+        try:
+            self._run_docker(["rm", "-f", name], timeout=timeout)
+        except (DockerUnavailable, OSError, subprocess.TimeoutExpired):
+            pass
+
+    def read(self, path: Path) -> bytes:
+        """Read a file inside the container for a workspace path.
+
+        Uses a throwaway container with the file's parent bind-mounted, so the
+        container's view is authoritative. This is the honest container
+        semantics: the bind mount makes host and container identical, but
+        reading through the container is what a future remote backend would do.
+        """
+        self._ensure_available()
+        name = f"burooj-read-{uuid.uuid4().hex[:8]}"
+        proc = self._run_docker(
+            [
+                "run", "--name", name, "--rm",
+                "-v", f"{path.parent}:{path.parent}",
+                self.image,
+                "cat", str(path),
+            ],
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            raise FileNotFoundError(str(path))
+        return proc.stdout.encode()
+
+    def write(self, path: Path, content: bytes) -> None:
+        """Write a file inside the container for a workspace path."""
+        self._ensure_available()
+        # docker exec cannot take stdin from a completed subprocess easily;
+        # write via a heredoc-free sh -c with base64 to stay byte-exact.
+        import base64
+
+        encoded = base64.b64encode(content).decode()
+        name = f"burooj-write-{uuid.uuid4().hex[:8]}"
+        proc = self._run_docker(
+            [
+                "run", "--name", name, "--rm",
+                "-v", f"{path.parent}:{path.parent}",
+                self.image,
+                "sh", "-lc",
+                f"mkdir -p {path.parent} && echo {encoded} | base64 -d > {path}",
+            ],
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            raise OSError(f"docker write failed for {path}: {proc.stderr.strip()}")
+
+    def port_status(self, port: int) -> PortStatus:
+        """Check the published host port. The container publishes
+        ``127.0.0.1:<port>:<port>``, so the host probe sees the real server."""
+        import socket
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        try:
+            result = sock.connect_ex(("localhost", port))
+            return PortStatus(port=port, listening=(result == 0))
+        finally:
+            sock.close()
+
+    def wait_for_port(
+        self, port: int, timeout: int = 30, path: str = "/"
+    ) -> bool:
+        import urllib.error
+        import urllib.request
+
+        url = f"http://localhost:{port}{path}"
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            try:
+                req = urllib.request.Request(url, method="HEAD")
+                resp = urllib.request.urlopen(req, timeout=2)
+                if resp.status < 500:
+                    return True
+            except (urllib.error.URLError, OSError, TimeoutError):
+                pass
+            time.sleep(0.5)
+
+        return False
+
+    def snapshot(self, workspace: Path) -> str:
+        raise NotImplementedError(
+            "DockerRuntime.snapshot is not implemented. Container snapshots "
+            "need a checkpoint protocol over the docker API; the local "
+            "checkpoint_manager covers host-side workspaces only."
+        )

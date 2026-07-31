@@ -2993,6 +2993,21 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Burooj mode model routing. Maps a ContextProfile.model_hint to a model
+    # id. "coding" serves Build mode, "vision" serves Design mode. An empty
+    # value (or an unmapped hint) falls back to the default model selection.
+    # Example:
+    #   burooj:
+    #     model_hints:
+    #       coding: "anthropic/claude-sonnet-4-5"
+    #       vision: "openrouter/google/gemini-3-pro"
+    "burooj": {
+        "model_hints": {
+            "coding": "",
+            "vision": "",
+        },
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 33,
 }

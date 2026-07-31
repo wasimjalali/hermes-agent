@@ -10,16 +10,18 @@ from agent.coding_context import ContextProfile, register_profile
 
 
 class TestBuroojProfilesResolve:
+    # Only the three specialisations pin. "agent" deliberately falls through to
+    # auto-detection so a code workspace keeps the coding posture; see the
+    # comment on AGENT_PROFILE and resolve_runtime_mode's docstring.
     @pytest.mark.parametrize(
         "name,expected",
         [
-            ("agent", bp.AGENT_PROFILE),
             ("sanad", bp.SANAD_PROFILE),
             ("build", bp.BUILD_PROFILE),
             ("design", bp.DESIGN_PROFILE),
         ],
     )
-    def test_resolves_by_name(self, tmp_path, name, expected):
+    def test_specialisations_pin_by_name(self, tmp_path, name, expected):
         mode = cc.resolve_runtime_mode(
             platform="desktop",
             cwd=tmp_path,
@@ -33,6 +35,27 @@ class TestBuroojProfilesResolve:
         assert mode.profile.toolset == expected.toolset
         assert mode.profile.model_hint == expected.model_hint
         assert mode.profile.memory_policy == expected.memory_policy
+
+    def test_agent_falls_through_to_detection(self, tmp_path):
+        """Agent must not pin, or a code workspace loses the coding posture."""
+        mode = cc.resolve_runtime_mode(
+            platform="desktop",
+            cwd=tmp_path,
+            config={"agent": {"coding_context": "auto"}},
+            profile="agent",
+        )
+        assert mode.pinned is False
+        assert mode.profile.name in {"general", "coding"}
+
+    def test_agent_mode_still_gets_its_brief(self, tmp_path):
+        """Whichever profile detection lands on must carry AGENT_GUIDANCE.
+
+        A bare directory detects as `general`, which has no guidance of its
+        own. Without the brief being merged in, selecting Agent in the desktop
+        produced a session with no operating brief at all.
+        """
+        mode = cc.resolve_runtime_mode(platform="desktop", cwd=tmp_path, profile="agent")
+        assert bp.AGENT_GUIDANCE in mode.profile.guidance
 
     def test_four_distinct_guidance_strings(self, tmp_path):
         guidances = []
@@ -120,6 +143,81 @@ class TestPinnedToolsetGate:
         )
         assert out is not None
         assert out[0] == "burooj_build"
+
+
+class TestModelRouting:
+    """Burooj mode model routing: model_hint → configured model (arch §10.2)."""
+
+    def test_design_hint_is_vision(self):
+        assert bp.DESIGN_PROFILE.model_hint == "vision"
+
+    def test_build_hint_is_coding(self):
+        assert bp.BUILD_PROFILE.model_hint == "coding"
+
+    def test_design_resolves_to_vision_model(self):
+        cfg = {"burooj": {"model_hints": {"vision": "openrouter/google/gemini-3-pro"}}}
+        assert bp.resolve_model_for_hint("vision", cfg) == "openrouter/google/gemini-3-pro"
+
+    def test_build_resolves_to_coding_model(self):
+        cfg = {"burooj": {"model_hints": {"coding": "anthropic/claude-sonnet-4-5"}}}
+        assert bp.resolve_model_for_hint("coding", cfg) == "anthropic/claude-sonnet-4-5"
+
+    def test_unmapped_hint_falls_back_to_default(self):
+        """An unmapped hint returns "" so the caller keeps the default model."""
+        assert bp.resolve_model_for_hint("vision", {}) == ""
+        assert bp.resolve_model_for_hint("coding", {"burooj": {}}) == ""
+        assert bp.resolve_model_for_hint("vision", None) == ""
+
+    def test_empty_or_missing_hint_falls_back(self):
+        assert bp.resolve_model_for_hint("", {"burooj": {"model_hints": {"vision": "x"}}}) == ""
+        assert bp.resolve_model_for_hint(None, {"burooj": {"model_hints": {"vision": "x"}}}) == ""
+
+    def test_non_string_value_falls_back(self):
+        cfg = {"burooj": {"model_hints": {"vision": 123}}}
+        assert bp.resolve_model_for_hint("vision", cfg) == ""
+
+    def test_gateway_routes_pinned_mode_models(self):
+        """End to end: the gateway model resolver honors the pinned mode."""
+        import tui_gateway.server as server
+
+        cfg = {
+            "burooj": {
+                "model_hints": {
+                    "coding": "anthropic/claude-sonnet-4-5",
+                    "vision": "openrouter/google/gemini-3-pro",
+                }
+            }
+        }
+
+        def fake_load_cfg():
+            return cfg
+
+        old = server._load_cfg
+        server._load_cfg = fake_load_cfg
+        try:
+            assert server._resolve_burooj_hint_model("design") == "openrouter/google/gemini-3-pro"
+            assert server._resolve_burooj_hint_model("build") == "anthropic/claude-sonnet-4-5"
+            # Agent falls through to detection: no pinned hint to honor.
+            assert server._resolve_burooj_hint_model("agent") == ""
+            # Unknown profile: clean fallback, no raise.
+            assert server._resolve_burooj_hint_model("not_a_mode") == ""
+        finally:
+            server._load_cfg = old
+
+    def test_gateway_falls_back_when_hints_unconfigured(self):
+        """No burooj.model_hints config: every mode keeps the default model."""
+        import tui_gateway.server as server
+
+        def fake_load_cfg():
+            return {}
+
+        old = server._load_cfg
+        server._load_cfg = fake_load_cfg
+        try:
+            assert server._resolve_burooj_hint_model("design") == ""
+            assert server._resolve_burooj_hint_model("build") == ""
+        finally:
+            server._load_cfg = old
 
 
 class TestRegisterProfile:

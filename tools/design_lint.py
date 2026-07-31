@@ -13,14 +13,16 @@ Each Violation: { file: str, line: int, column: int, rule: str, value: str, mess
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Optional
 
 from agent.build_workspace import resolve_workspace
+from tools.registry import registry
 
 logger = logging.getLogger("hermes.design_lint")
 
@@ -39,10 +41,14 @@ _RAW_HEX_RE = re.compile(
     r"""(?<![&$])\#([0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\b"""
 )
 
-# Regex: arbitrary Tailwind values like bg-[#ff0000], p-[13px], text-[17px].
+# Regex: arbitrary Tailwind values like bg-[#ff0000], p-[13px], grid-rows-[20px].
+# Longest alternatives first so `min-w` wins over `w` and `grid-cols` over `col`.
 _ARBITRARY_TW_RE = re.compile(
-    r"""(?:bg|text|border|ring|shadow|p|px|py|pt|pb|pl|pr|m|mx|my|mt|mb|ml|mr|"""
-    r"""gap|space|w|h|min-w|min-h|max-w|max-h|rounded|inset|top|left|right|bottom)"""
+    r"""(?:min-w|min-h|max-w|max-h|grid-cols|grid-rows|col-span|row-span|"""
+    r"""leading|tracking|translate|rounded|shadow|border|inset|bottom|"""
+    r"""aspect|basis|content|opacity|scale|order|space|right|font|ring|"""
+    r"""left|text|fill|flex|gap|top|bg|px|py|pt|pb|pl|pr|mx|my|mt|mb|ml|mr|"""
+    r"""p|m|w|h|z)"""
     r"""-\[([^\]]+)\]"""
 )
 
@@ -52,6 +58,78 @@ _RAW_PX_RE = re.compile(r"""(?<!\$value["\s:])(?<![a-zA-Z-])([1-9]\d*px)\b""")
 
 # Files/dirs that are part of the design system (never lint these).
 _DESIGN_SYSTEM_PATHS = {"burooj.design", "tokens.json", "tokens.css", "tailwind.tokens.js"}
+
+# Inline escape hatches. A gate with no way to say "this one is deliberate"
+# gets switched off wholesale by the first person who hits a false positive,
+# which is strictly worse than a gate with a documented exception.
+_DISABLE_FILE_RE = re.compile(r"burooj-design-lint-disable-file")
+_DISABLE_LINE_RE = re.compile(r"burooj-design-lint-disable-line")
+_DISABLE_NEXT_RE = re.compile(r"burooj-design-lint-disable-next-line")
+
+# Optional per-workspace allowlist, JSON at burooj.design/lint-ignore.json:
+#   { "paths": ["src/components/ui/**"], "rules": { "raw-px": ["src/legacy/**"] } }
+_IGNORE_FILENAME = "lint-ignore.json"
+
+
+@dataclass(frozen=True)
+class IgnoreConfig:
+    """Parsed lint-ignore.json."""
+
+    paths: tuple[str, ...] = ()
+    rules: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    def covers(self, rel_path: str, rule: str) -> bool:
+        """True when *rel_path* is exempt, globally or for this *rule*."""
+        posix = PurePath(rel_path).as_posix()
+        if any(PurePath(posix).match(pattern) for pattern in self.paths):
+            return True
+        for rule_name, patterns in self.rules:
+            if rule_name != rule:
+                continue
+            if any(PurePath(posix).match(pattern) for pattern in patterns):
+                return True
+        return False
+
+
+def _load_ignore_config(workspace: Path) -> IgnoreConfig:
+    """Read burooj.design/lint-ignore.json. Absent or malformed means no exemptions."""
+    path = workspace / "burooj.design" / _IGNORE_FILENAME
+    if not path.is_file():
+        return IgnoreConfig()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Ignoring malformed %s: %s", path, exc)
+        return IgnoreConfig()
+    if not isinstance(data, dict):
+        return IgnoreConfig()
+
+    raw_paths = data.get("paths", [])
+    paths = tuple(p for p in raw_paths if isinstance(p, str)) if isinstance(raw_paths, list) else ()
+
+    raw_rules = data.get("rules", {})
+    rules: list[tuple[str, tuple[str, ...]]] = []
+    if isinstance(raw_rules, dict):
+        for rule_name, patterns in raw_rules.items():
+            if isinstance(rule_name, str) and isinstance(patterns, list):
+                rules.append(
+                    (rule_name, tuple(p for p in patterns if isinstance(p, str)))
+                )
+    return IgnoreConfig(paths=paths, rules=tuple(rules))
+
+
+def _disabled_lines(content: str) -> tuple[bool, set[int]]:
+    """Return (whole file disabled, set of 1-indexed disabled line numbers)."""
+    lines = content.splitlines()
+    if any(_DISABLE_FILE_RE.search(line) for line in lines[:20]):
+        return True, set()
+    disabled: set[int] = set()
+    for idx, line in enumerate(lines, start=1):
+        if _DISABLE_NEXT_RE.search(line):
+            disabled.add(idx + 1)
+        elif _DISABLE_LINE_RE.search(line):
+            disabled.add(idx)
+    return False, disabled
 
 
 @dataclass
@@ -100,6 +178,7 @@ def _check_raw_hex(content: str, rel_path: str) -> list[Violation]:
     for line_num, line in enumerate(content.splitlines(), start=1):
         if _is_in_comment_or_config(line):
             continue
+        tw_spans = _tailwind_spans(line)
         for match in _RAW_HEX_RE.finditer(line):
             # Skip if it's inside a CSS variable reference.
             before = line[:match.start()]
@@ -107,6 +186,11 @@ def _check_raw_hex(content: str, rel_path: str) -> list[Violation]:
                 continue
             # Skip if it's in a CSS custom property definition (token output).
             if re.match(r"\s*--", line):
+                continue
+            # `bg-[#ff0000]` is one mistake. Reporting it as both raw-hex and
+            # arbitrary-tailwind doubled the violation count and buried the
+            # signal under its own duplicates.
+            if any(start <= match.start() < end for start, end in tw_spans):
                 continue
             violations.append(Violation(
                 file=rel_path,
@@ -137,6 +221,16 @@ def _check_arbitrary_tailwind(content: str, rel_path: str) -> list[Violation]:
     return violations
 
 
+def _tailwind_spans(line: str) -> list[tuple[int, int]]:
+    """Character spans already reported as arbitrary Tailwind values.
+
+    A `p-[13px]` is one mistake, not two. Without this the same span was
+    reported once as `arbitrary-tailwind` and again as `raw-px`, which made
+    every violation count roughly double and buried the real signal.
+    """
+    return [(m.start(), m.end()) for m in _ARBITRARY_TW_RE.finditer(line)]
+
+
 def _check_raw_px(content: str, rel_path: str) -> list[Violation]:
     """Check for raw pixel values in style attributes."""
     violations: list[Violation] = []
@@ -155,7 +249,11 @@ def _check_raw_px(content: str, rel_path: str) -> list[Violation]:
         # Skip CSS custom property definitions.
         if re.match(r"\s*--", line):
             continue
+        tw_spans = _tailwind_spans(line)
         for match in _RAW_PX_RE.finditer(line):
+            # Already counted as an arbitrary Tailwind value.
+            if any(start <= match.start() < end for start, end in tw_spans):
+                continue
             violations.append(Violation(
                 file=rel_path,
                 line=line_num,
@@ -201,7 +299,9 @@ def design_lint(workspace: Optional[Path] = None) -> dict[str, Any]:
         workspace = resolve_workspace()
 
     source_files = _walk_source_files(workspace)
+    ignore = _load_ignore_config(workspace)
     all_violations: list[Violation] = []
+    suppressed = 0
 
     for file_path, rel_path in source_files:
         try:
@@ -209,12 +309,75 @@ def design_lint(workspace: Optional[Path] = None) -> dict[str, Any]:
         except OSError:
             continue
 
-        all_violations.extend(_check_raw_hex(content, rel_path))
-        all_violations.extend(_check_arbitrary_tailwind(content, rel_path))
-        all_violations.extend(_check_raw_px(content, rel_path))
+        file_disabled, disabled_lines = _disabled_lines(content)
+        if file_disabled:
+            continue
 
-    return {
+        found = (
+            _check_raw_hex(content, rel_path)
+            + _check_arbitrary_tailwind(content, rel_path)
+            + _check_raw_px(content, rel_path)
+        )
+        for violation in found:
+            if violation.line in disabled_lines or ignore.covers(rel_path, violation.rule):
+                suppressed += 1
+                continue
+            all_violations.append(violation)
+
+    passed = not all_violations
+    result: dict[str, Any] = {
         "violations": [v.to_dict() for v in all_violations],
-        "passed": len(all_violations) == 0,
+        "passed": passed,
+        "status": "pass" if passed else "fail",
         "files_scanned": len(source_files),
+        "summary": f"{len(source_files)} files scanned",
     }
+    if suppressed:
+        result["suppressed"] = suppressed
+        result["summary"] += f", {suppressed} suppressed"
+    if not source_files:
+        result["status"] = "skip"
+        result["reason"] = "no lintable source files in the workspace"
+
+    # The desktop Design panel shows the last lint run. Record it here so a
+    # model-driven run inside a session is visible to the panel.
+    from agent.burooj_status import record_design_check
+
+    record_design_check(workspace, "design_lint", result)
+
+    return result
+
+
+# ── Tool registration ───────────────────────────────────────────────────────
+
+DESIGN_LINT_SCHEMA = {
+    "name": "design_lint",
+    "description": (
+        "Scan the workspace for code that bypasses the design system: raw hex "
+        "colors, raw pixel values and arbitrary Tailwind values. Deterministic, "
+        "no server needed. Rung 1 of the design gate. Suppress a deliberate "
+        "exception with a 'burooj-design-lint-disable-next-line' comment or "
+        "burooj.design/lint-ignore.json."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+
+def handle_design_lint(args: dict[str, Any], **kwargs: Any) -> str:
+    """Model-facing entry point for design_lint."""
+    try:
+        return json.dumps(design_lint(), indent=2)
+    except Exception as exc:
+        logger.exception("design_lint failed")
+        return json.dumps(
+            {"error": f"design_lint crashed: {type(exc).__name__}: {exc}", "passed": False}
+        )
+
+
+registry.register(
+    name="design_lint",
+    toolset="burooj_design",
+    schema=DESIGN_LINT_SCHEMA,
+    handler=handle_design_lint,
+    emoji="📐",
+)

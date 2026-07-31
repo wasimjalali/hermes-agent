@@ -15,15 +15,24 @@ Each RouteResult: { path: str, screenshot: str, console_errors: list, network_er
 
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from agent.build_manifest import BuildManifest, ManifestError, load_manifest
-from agent.build_runtime import ProcessHandle, get_runtime
+from agent.build_manifest import ManifestError
+from agent.build_session import BuildSession, get_session
 from agent.build_workspace import resolve_workspace
+from tools.burooj_browser import (
+    _CAPTURE_TIMEOUT,
+    _NAV_TIMEOUT_MS,
+    _WAIT_UNTIL,
+    PLAYWRIGHT_MISSING,
+    new_page,
+    run_async,
+)
+from tools.registry import registry
 
 logger = logging.getLogger("hermes.preview_tool")
 
@@ -45,6 +54,7 @@ class RouteResult:
     path: str
     screenshot: str = ""
     console_errors: list[str] = field(default_factory=list)
+    console_warnings: list[str] = field(default_factory=list)
     network_errors: list[str] = field(default_factory=list)
     status: int = 0
 
@@ -53,6 +63,7 @@ class RouteResult:
             "path": self.path,
             "screenshot": self.screenshot,
             "console_errors": self.console_errors,
+            "console_warnings": self.console_warnings,
             "network_errors": self.network_errors,
             "status": self.status,
         }
@@ -61,19 +72,34 @@ class RouteResult:
 async def _capture_route(
     page: Any, base_url: str, route_path: str, screenshot_dir: Path
 ) -> RouteResult:
-    """Navigate to a route and capture screenshot + errors."""
+    """Navigate to a route and capture screenshot + errors.
+
+    The caller supplies a page dedicated to this route. Listeners registered
+    here therefore stop mattering once the page closes. On a shared page they
+    did not: each route added another handler, and an earlier route's error
+    list kept growing while later routes loaded, long after it was returned.
+    """
     result = RouteResult(path=route_path)
     console_errors: list[str] = []
+    console_warnings: list[str] = []
     network_errors: list[str] = []
 
-    # Listen for console errors.
     def on_console(msg: Any) -> None:
-        if msg.type in ("error", "warning"):
-            console_errors.append(f"[{msg.type}] {msg.text}")
+        # Errors and warnings are not the same signal and must not share a
+        # field: a dev server warns routinely, and folding those into
+        # console_errors made every route look broken.
+        if msg.type == "error":
+            console_errors.append(msg.text)
+        elif msg.type == "warning":
+            console_warnings.append(msg.text)
 
     page.on("console", on_console)
 
-    # Listen for network failures.
+    def on_page_error(exc: Any) -> None:
+        console_errors.append(f"Uncaught: {exc}")
+
+    page.on("pageerror", on_page_error)
+
     def on_request_failed(request: Any) -> None:
         network_errors.append(f"{request.method} {request.url} - {request.failure}")
 
@@ -81,7 +107,7 @@ async def _capture_route(
 
     url = f"{base_url}{route_path}"
     try:
-        response = await page.goto(url, wait_until="networkidle", timeout=15000)
+        response = await page.goto(url, wait_until=_WAIT_UNTIL, timeout=_NAV_TIMEOUT_MS)
         result.status = response.status if response else 0
     except Exception as exc:
         result.status = 0
@@ -97,86 +123,64 @@ async def _capture_route(
         logger.warning("Screenshot failed for %s: %s", route_path, exc)
 
     result.console_errors = console_errors
+    result.console_warnings = console_warnings
     result.network_errors = network_errors
     return result
 
 
-async def _run_preview(
-    manifest: BuildManifest,
-    workspace: Path,
-    routes: list[str],
-) -> dict[str, Any]:
-    """Async implementation of preview."""
+async def _run_preview(session: BuildSession, routes: list[str]) -> dict[str, Any]:
+    """Async implementation of preview, against the shared dev server."""
     try:
         from playwright.async_api import async_playwright
     except ImportError:
+        return {"routes": [], "server_healthy": False, "error": PLAYWRIGHT_MISSING}
+
+    screenshot_dir = session.workspace / _PREVIEW_DIR
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
+
+    status = session.ensure_server(timeout=_SERVER_READY_TIMEOUT)
+    if not status.ready:
         return {
             "routes": [],
             "server_healthy": False,
-            "error": "playwright not installed. Run: pip install playwright && python -m playwright install chromium",
+            "error": status.reason,
+            "server_stdout": status.stdout[-50:],
+            "server_stderr": status.stderr[-50:],
         }
 
-    # Ensure screenshot directory exists.
-    screenshot_dir = workspace / _PREVIEW_DIR
-    screenshot_dir.mkdir(parents=True, exist_ok=True)
-
-    # Start the dev server via the Runtime seam (continuous stdout/stderr capture).
-    runtime = get_runtime()
-    env = {"PORT": str(manifest.dev.port)}
-    handle: ProcessHandle = runtime.start_process(
-        command=manifest.dev.command,
-        cwd=workspace,
-        env=env,
-    )
-
-    try:
-        # Wait for server to be ready via the Runtime seam.
-        ready = runtime.wait_for_port(
-            port=manifest.dev.port,
-            timeout=_SERVER_READY_TIMEOUT,
-            path=manifest.dev.ready,
-        )
-        if not ready:
-            # Collect whatever the server printed before dying.
-            server_stdout = handle.get_stdout()
-            server_stderr = handle.get_stderr()
-            return {
-                "routes": [],
-                "server_healthy": False,
-                "error": f"Dev server did not become ready within {_SERVER_READY_TIMEOUT}s",
-                "server_stdout": server_stdout[-50:] if server_stdout else [],
-                "server_stderr": server_stderr[-50:] if server_stderr else [],
-            }
-
-        base_url = f"http://localhost:{manifest.dev.port}"
-
-        # Drive Playwright through each route.
-        route_results: list[dict[str, Any]] = []
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                viewport={"width": _VIEWPORT_WIDTH, "height": _VIEWPORT_HEIGHT}
-            )
-            page = await context.new_page()
-
+    route_results: list[dict[str, Any]] = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
             for route_path in routes:
-                result = await _capture_route(page, base_url, route_path, screenshot_dir)
+                page = await new_page(browser, _VIEWPORT_WIDTH, _VIEWPORT_HEIGHT)
+                result = await _capture_route(
+                    page, status.base_url, route_path, screenshot_dir
+                )
                 route_results.append(result.to_dict())
-
+                await page.close()
+        finally:
             await browser.close()
 
-        # Collect server output captured during the run.
-        server_stdout = handle.get_stdout()
-        server_stderr = handle.get_stderr()
+    # The dev server deliberately stays up. Preview is called repeatedly during
+    # a session, and paying a cold Next.js boot on every call was the single
+    # biggest source of latency in the loop.
+    server_stdout, server_stderr = session.server_output()
+    result = {
+        "routes": route_results,
+        "server_healthy": session.server_running,
+        "server_reused": status.reused,
+        "server_stdout": server_stdout[-100:],
+        "server_stderr": server_stderr[-100:],
+    }
 
-        return {
-            "routes": route_results,
-            "server_healthy": handle.is_running,
-            "server_stdout": server_stdout[-100:] if server_stdout else [],
-            "server_stderr": server_stderr[-100:] if server_stderr else [],
-        }
-    finally:
-        runtime.stop_process(handle)
+    # The desktop Build panel shows the most recent preview. Record it here
+    # so a model-driven preview inside a session is visible to the panel.
+    from agent.burooj_status import record_preview
+
+    record_preview(session.workspace, result)
+
+    return result
 
 
 def preview(
@@ -203,30 +207,70 @@ def preview(
     if workspace is None:
         workspace = resolve_workspace()
 
-    # Load the manifest.
     try:
-        manifest = load_manifest(workspace)
+        session = get_session(Path(workspace))
     except ManifestError as exc:
+        return {"routes": [], "server_healthy": False, "error": str(exc)}
+
+    if session.manifest.dev is None:
         return {
             "routes": [],
             "server_healthy": False,
-            "error": str(exc),
+            "error": "No 'dev' section in burooj.build.json, so there is no server to preview.",
         }
 
-    # Use manifest routes if none specified.
     if routes is None:
-        routes = manifest.routes
+        routes = session.manifest.routes
 
-    # Run the async preview.
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # If already in an async context, create a new loop in a thread.
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, _run_preview(manifest, workspace, routes))
-                return future.result(timeout=60)
-        else:
-            return loop.run_until_complete(_run_preview(manifest, workspace, routes))
-    except RuntimeError:
-        return asyncio.run(_run_preview(manifest, workspace, routes))
+        return run_async(_run_preview(session, routes), timeout=_CAPTURE_TIMEOUT)
+    except TimeoutError as exc:
+        return {"routes": [], "server_healthy": session.server_running, "error": str(exc)}
+
+
+# ── Tool registration ───────────────────────────────────────────────────────
+
+PREVIEW_SCHEMA = {
+    "name": "preview",
+    "description": (
+        "Boot the dev server and drive a real browser over each declared "
+        "route: screenshot, console errors, uncaught exceptions and failed "
+        "requests, plus the server's own stdout/stderr. This is how you see "
+        "whether the app actually renders, not just whether it compiled. The "
+        "server stays up between calls."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "routes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Routes to capture. Omit to use the manifest's routes.",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def handle_preview(args: dict[str, Any], **kwargs: Any) -> str:
+    """Model-facing entry point for the preview tool."""
+    routes = args.get("routes")
+    if routes is not None and (
+        not isinstance(routes, list) or not all(isinstance(r, str) for r in routes)
+    ):
+        return json.dumps({"error": "'routes' must be an array of strings."})
+    try:
+        return json.dumps(preview(routes=routes), indent=2)
+    except Exception as exc:
+        logger.exception("preview failed")
+        return json.dumps({"error": f"preview crashed: {type(exc).__name__}: {exc}"})
+
+
+registry.register(
+    name="preview",
+    toolset="burooj_build",
+    schema=PREVIEW_SCHEMA,
+    handler=handle_preview,
+    emoji="🔍",
+)

@@ -8,10 +8,21 @@ profile lookup (see the deferred import at the bottom of coding_context.py).
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from agent.coding_context import (
     ContextProfile,
     _NON_CODING_SKILL_CATEGORIES,
     register_profile,
+)
+
+# Skill categories demoted to names-only under Design's focus mode. Design is
+# not a coding posture, so the coding deny-list is the wrong shape: keep the
+# creative and media categories a designer reaches for, drop the rest.
+_NON_DESIGN_SKILL_CATEGORIES = (
+    "apple", "communication", "cooking", "email", "finance", "gaming",
+    "health", "music", "note-taking", "shopping", "smart-home",
+    "social-media", "travel", "yuanbao",
 )
 
 # ── Guidance briefs ──────────────────────────────────────────────────────────
@@ -42,18 +53,23 @@ BUILD_GUIDANCE = (
     "No raw hex, no arbitrary spacing.\n"
     "3. Never call work done because it compiled.\n"
     "The verification ladder runs after every edit (fail-fast, cheap to expensive):\n"
-    "  1. typecheck (zero errors)\n"
-    "  2. lint (clean)\n"
-    "  3. fix tests pass (proves the change)\n"
-    "  4. guard tests pass (proves nothing broke)\n"
-    "  5. build succeeds\n"
-    "  6. render (dev server up, routes screenshot, zero console errors)\n"
-    "  7. design_gate (lint tokens, contrast, a11y, visual diff)\n"
-    "Use `verify()` to run the ladder. Use `repo_map()` to understand the "
-    "codebase. Use `preview()` to capture route screenshots and check for errors. "
+    "  1. install (dependencies present)\n"
+    "  2. typecheck (zero errors)\n"
+    "  3. lint (clean)\n"
+    "  4. fix tests pass (proves the change)\n"
+    "  5. guard tests pass (proves nothing broke)\n"
+    "  6. build succeeds\n"
+    "  7. render (dev server up, every route responds, no server errors)\n"
+    "  8. design_gate (token lint, contrast, a11y, visual diff)\n"
+    "Use `verify()` to run the ladder; pass `rungs` to re-check one thing fast. "
+    "A rung reporting `skip` means the project declares no such step. A rung "
+    "reporting `error` means the check could not run, which is never a pass.\n"
+    "Use `repo_map()` first in an unfamiliar codebase, before reading files. "
+    "Use `preview()` to see what a route actually renders and what the console "
+    "and dev server report. "
     "Use `sanad_search()` to look up company standards, brand guidelines, or "
     "product requirements before guessing. "
-    "Report what you verified."
+    "Report what you verified, naming the rungs."
 )
 
 DESIGN_GUIDANCE = (
@@ -65,6 +81,9 @@ DESIGN_GUIDANCE = (
     "`build/tokens.css` and `build/tailwind.tokens.js`. "
     "Deterministic checks decide (token lint, contrast, a11y, visual diff). "
     "Vision-model critique is advisory only and never blocks. "
+    "Use `element_map()` to stamp the running app with data-oid and "
+    "`visual_edit()` to patch the JSX behind an element; edits land in source "
+    "and are verified by re-parsing. "
     "Use `sanad_search()` to look up brand guidelines, accessibility policies, "
     "or design standards from the company knowledge base before making decisions. "
     "Refuse one-off visual hacks that skip the system."
@@ -72,6 +91,19 @@ DESIGN_GUIDANCE = (
 
 # ── Profiles ─────────────────────────────────────────────────────────────────
 
+# Agent is the odd one out and deliberately so.
+#
+# ``resolve_runtime_mode`` lets "agent" fall through to auto-detection rather
+# than pinning this profile, because pinning it would strip the coding posture
+# in a code workspace. The consequence is that this profile is never the
+# resolved profile, and its guidance would never reach a prompt.
+#
+# Registering it anyway is not decoration: ``get_profile("agent")`` is a real
+# lookup path (session resume, gateway introspection, tests), and the toolset
+# name is what the desktop shows. What must not happen is Agent mode silently
+# operating with no brief at all, which is what happened in a non-code
+# directory where detection landed on ``general``. So the brief is appended to
+# the two profiles detection can actually pick, below.
 AGENT_PROFILE = ContextProfile(
     name="agent",
     toolset="burooj_agent",
@@ -103,6 +135,7 @@ DESIGN_PROFILE = ContextProfile(
     guidance=DESIGN_GUIDANCE,
     model_hint="vision",
     memory_policy="design",
+    compact_skill_categories=_NON_DESIGN_SKILL_CATEGORIES,
 )
 
 BUROOJ_PROFILES: tuple[ContextProfile, ...] = (
@@ -114,6 +147,63 @@ BUROOJ_PROFILES: tuple[ContextProfile, ...] = (
 
 for _profile in BUROOJ_PROFILES:
     register_profile(_profile)
+
+
+def with_agent_brief(profile: ContextProfile) -> ContextProfile:
+    """Return *profile* with the Burooj Agent brief appended to its guidance.
+
+    Agent mode resolves through auto-detection, so it lands on ``coding`` or
+    ``general``. Without this, selecting Agent in the desktop gave the user
+    either plain base-Hermes coding guidance or, in a non-code directory, no
+    guidance whatsoever, and AGENT_GUIDANCE was dead text.
+
+    Appending rather than replacing is the point: the coding posture is what
+    makes Agent good in a code workspace, and the Burooj brief adds the
+    product framing on top instead of overwriting it.
+
+    Returns a NEW profile and never mutates the registry. The shared ``coding``
+    and ``general`` entries belong to base Hermes; re-registering modified
+    copies of them changed behaviour for every non-Burooj caller and broke
+    upstream identity assertions. ``resolve_runtime_mode`` calls this only on
+    the Burooj Agent path.
+    """
+    existing = profile.guidance.strip()
+    combined = f"{existing}\n\n{AGENT_GUIDANCE}" if existing else AGENT_GUIDANCE
+    return replace(profile, guidance=combined)
+
+
+def resolve_model_for_hint(
+    hint: Optional[str], cfg: Optional[dict] = None
+) -> str:
+    """Map a profile ``model_hint`` to a configured model id.
+
+    Reads ``burooj.model_hints.<hint>`` from config.yaml. Returns an empty
+    string when the hint is unset, the config section is missing, or the hint
+    is unmapped, so the caller falls back to the default model selection
+    instead of erroring.
+
+    Parameters
+    ----------
+    hint : str, optional
+        The ``ContextProfile.model_hint`` value (e.g. "coding", "vision").
+    cfg : dict, optional
+        The config dict (``burooj`` root). When None, reads
+        ``burooj.model_hints`` from the user config via the gateway loaders.
+    """
+    if not hint:
+        return ""
+    if cfg is None:
+        return ""  # no config source supplied: never guess a model
+    try:
+        hints = (cfg.get("burooj") or {}).get("model_hints") or {}
+    except AttributeError:
+        return ""
+    if not isinstance(hints, dict):
+        return ""
+    value = hints.get(hint)
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
 
 __all__ = [
     "AGENT_GUIDANCE",
