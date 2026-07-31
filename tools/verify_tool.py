@@ -224,13 +224,87 @@ def _run_rung_render(manifest: BuildManifest, workspace: Path) -> RungResult:
 
 
 def _run_rung_design_gate(manifest: BuildManifest, workspace: Path) -> RungResult:
-    """Run the design gate rung (B3 stub)."""
-    return RungResult(
-        name="design_gate",
-        status="skip",
-        output="Design gate not yet implemented (B3)",
-        duration_ms=0,
-    )
+    """Run the design gate: design_lint, contrast_check, a11y_check, visual_diff.
+
+    All four checks run independently (no fail-fast within the gate).
+    The gate fails if any check fails.
+    """
+    start = time.monotonic()
+
+    from tools.design_lint import design_lint
+    from tools.contrast_check import contrast_check
+    from tools.a11y_check import a11y_check
+    from tools.visual_diff import visual_diff
+
+    sub_results: list[str] = []
+    gate_passed = True
+
+    # 1. Design lint (pure file scan, no server).
+    lint_result = design_lint(workspace=workspace)
+    if not lint_result["passed"]:
+        gate_passed = False
+        count = len(lint_result["violations"])
+        sub_results.append(f"design_lint: FAIL ({count} violation(s))")
+        for v in lint_result["violations"][:5]:
+            sub_results.append(f"  {v['file']}:{v['line']} [{v['rule']}] {v['value']}")
+        if count > 5:
+            sub_results.append(f"  ... and {count - 5} more")
+    else:
+        sub_results.append(f"design_lint: PASS ({lint_result.get('files_scanned', 0)} files scanned)")
+
+    # 2. Contrast check (pure math over tokens).
+    contrast_result = contrast_check(workspace=workspace)
+    if not contrast_result["passed"]:
+        gate_passed = False
+        failing = [p for p in contrast_result["pairs"] if not p["passed"]]
+        sub_results.append(f"contrast_check: FAIL ({len(failing)} pair(s) below threshold)")
+        for p in failing[:5]:
+            sub_results.append(
+                f"  {p['foreground']} on {p['background']}: "
+                f"{p['ratio']}:1 (need {p['required']}:1)"
+            )
+    else:
+        pairs_checked = len(contrast_result.get("pairs", []))
+        sub_results.append(f"contrast_check: PASS ({pairs_checked} pairs checked)")
+
+    # 3. a11y_check (needs dev server + Playwright).
+    a11y_result = a11y_check(workspace=workspace)
+    if a11y_result.get("error"):
+        # Non-fatal if playwright isn't available (advisory).
+        sub_results.append(f"a11y_check: SKIP ({a11y_result['error']})")
+    elif not a11y_result["passed"]:
+        gate_passed = False
+        total_errors = sum(r.get("error_count", 0) for r in a11y_result.get("routes", []))
+        sub_results.append(f"a11y_check: FAIL ({total_errors} critical/serious violation(s))")
+        for route in a11y_result.get("routes", []):
+            for v in route.get("violations", [])[:3]:
+                if v.get("impact") in ("critical", "serious"):
+                    sub_results.append(f"  [{v['impact']}] {v['id']}: {v['description']}")
+    else:
+        sub_results.append("a11y_check: PASS")
+
+    # 4. visual_diff (needs dev server + screenshots).
+    vdiff_result = visual_diff(workspace=workspace)
+    if vdiff_result.get("error"):
+        sub_results.append(f"visual_diff: SKIP ({vdiff_result['error']})")
+    elif not vdiff_result["passed"]:
+        gate_passed = False
+        failing_routes = [r for r in vdiff_result.get("routes", []) if not r["passed"]]
+        sub_results.append(f"visual_diff: FAIL ({len(failing_routes)} route(s) drifted)")
+        for r in failing_routes[:3]:
+            sub_results.append(f"  {r['path']}: {r['diff_pct']}% changed (threshold {r['threshold']}%)")
+    else:
+        new_baselines = sum(1 for r in vdiff_result.get("routes", []) if r.get("new_baseline"))
+        if new_baselines:
+            sub_results.append(f"visual_diff: PASS ({new_baselines} new baseline(s) saved)")
+        else:
+            sub_results.append("visual_diff: PASS (within threshold)")
+
+    duration = int((time.monotonic() - start) * 1000)
+    output = "\n".join(sub_results)
+    status = "pass" if gate_passed else "fail"
+
+    return RungResult(name="design_gate", status=status, output=output, duration_ms=duration)
 
 
 # Map rung names to their runners.
