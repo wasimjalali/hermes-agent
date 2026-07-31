@@ -614,3 +614,57 @@ class TestImportGuardFailsLoud:
         spec = importlib.util.find_spec("agent.burooj_profiles")
         assert spec is None
         # No exception — the guard skips the import
+
+
+class TestOperatorInstructionsScope:
+    """Operator coding_instructions must only inject into coding postures."""
+
+    def test_sanad_and_design_skip_operator_instructions(self, tmp_path):
+        """Non-coding modes (sanad, design) must not receive coding instructions."""
+        _git_init(tmp_path)
+        cfg = {
+            "agent": {
+                "coding_context": "auto",
+                "coding_instructions": "Always run lint before commit.",
+            }
+        }
+        for name in ("sanad", "design"):
+            mode = cc.resolve_runtime_mode(
+                platform="desktop", cwd=tmp_path, config=cfg, profile=name
+            )
+            blocks = mode.system_blocks()
+            assert not any("Operator instructions" in b for b in blocks), (
+                f"{name} should not get operator coding instructions"
+            )
+
+    def test_build_gets_operator_instructions(self, tmp_path):
+        """Build (model_hint='coding') should receive operator instructions."""
+        _git_init(tmp_path)
+        cfg = {
+            "agent": {
+                "coding_context": "auto",
+                "coding_instructions": "Always run lint before commit.",
+            }
+        }
+        mode = cc.resolve_runtime_mode(
+            platform="desktop", cwd=tmp_path, config=cfg, profile="build"
+        )
+        blocks = mode.system_blocks()
+        assert any("Operator instructions" in b for b in blocks)
+        assert any("Always run lint before commit." in b for b in blocks)
+
+    def test_coding_posture_gets_operator_instructions(self, tmp_path):
+        """The natural coding posture (no pin) still receives instructions."""
+        _git_init(tmp_path)
+        cfg = {
+            "agent": {
+                "coding_context": "auto",
+                "coding_instructions": "Clean the diff.",
+            }
+        }
+        mode = cc.resolve_runtime_mode(
+            platform="desktop", cwd=tmp_path, config=cfg
+        )
+        assert mode.is_coding
+        blocks = mode.system_blocks()
+        assert any("Clean the diff." in b for b in blocks)

@@ -564,7 +564,7 @@ class RuntimeMode:
                 workspace_parts.append(workspace)
         # Operator instructions ride their own block so the brief (block 0) stays
         # byte-stable and cache-keyed independently of user config.
-        if self.instructions and (self.is_coding or self.pinned):
+        if self.instructions and (self.is_coding or self.profile.model_hint == "coding"):
             trailing.append(f"Operator instructions (from config):\n{self.instructions}")
         return prefix, workspace_parts, trailing
 
