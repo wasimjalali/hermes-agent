@@ -406,11 +406,15 @@ def _run_rung_design_gate(manifest: BuildManifest, session: BuildSession) -> Run
 
     record("visual_diff", vdiff_result, vdiff_detail)
 
-    # Rung 5 of the design gate: VLM critique. Deliberately advisory.
-    # Vision models are not reproducible, and a gate that fails differently
-    # on identical input is worse than no gate. It reports, it does not
-    # decide, and it can never flip the gate.
-    vlm_result = _run_rung_vlm_advisory(session)
+    # Rung 5 of the design gate: VLM critique. Deliberately advisory and
+    # opt-in. Vision models cost money, leave the machine, and are not
+    # reproducible; a full ladder must not call them by default. Enable with
+    # config ``burooj.vlm_critique: true`` or env ``BUROOJ_VLM_CRITIQUE=1``.
+    vlm_result = (
+        _run_rung_vlm_advisory(session)
+        if _vlm_critique_enabled()
+        else []
+    )
 
     duration = int((time.monotonic() - start) * 1000)
     return RungResult(
@@ -420,6 +424,29 @@ def _run_rung_design_gate(manifest: BuildManifest, session: BuildSession) -> Run
         duration_ms=duration,
         hint=_HINTS["design_gate"] if not gate_passed else "",
     )
+
+
+def _vlm_critique_enabled() -> bool:
+    """Whether the advisory VLM critique runs inside the design gate.
+
+    Off by default. Opt in via ``BUROOJ_VLM_CRITIQUE=1`` or
+    ``burooj.vlm_critique: true`` in config.yaml.
+    """
+    import os
+
+    env = os.environ.get("BUROOJ_VLM_CRITIQUE", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        flag = (cfg.get("burooj") or {}).get("vlm_critique")
+        return bool(flag)
+    except Exception:
+        return False
 
 
 def _run_rung_vlm_advisory(session: BuildSession) -> list[str]:

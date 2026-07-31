@@ -47,13 +47,15 @@ def fake_docker(tmp_path: Path) -> str:
             ;;
           run)
             # docker run [-d] [--name X] [--rm] [-v ...] [-w ...] [-p ...] [-e K=V] IMAGE sh -lc CMD
-            NAME=""; DETACH=""
+            NAME=""; DETACH=""; WORKDIR=""; ENV_EXPORTS=""
             while [ "$#" -gt 0 ]; do
               case "$1" in
                 -d) DETACH="1"; shift ;;
                 --name) NAME="$2"; shift 2 ;;
                 --rm|--init) shift ;;
-                -v|-w|-p|-e) shift 2 ;;
+                -w) WORKDIR="$2"; shift 2 ;;
+                -e) ENV_EXPORTS="$ENV_EXPORTS export $2;"; shift 2 ;;
+                -v|-p) shift 2 ;;
                 -*) shift ;;
                 *) break ;;
               esac
@@ -72,18 +74,24 @@ def fake_docker(tmp_path: Path) -> str:
               echo "pull access denied" >&2
               exit 1
             fi
+            # Honor -w and -e so start_process looks like a real container.
+            WRAP="$ENV_EXPORTS"
+            if [ -n "$WORKDIR" ]; then
+              WRAP="$WRAP cd \"$WORKDIR\" && "
+            fi
+            FULL="${WRAP}${CMDSTR}"
             if [ -n "$DETACH" ]; then
               # Detached: fully detach like a real daemon. The child must not
               # hold the CLI's stdout/stderr pipes or it dies when the caller
               # closes them; its log goes to a file `docker logs` can replay.
               # nohup + </dev/null keeps it alive after the parent shell exits
               # (portable: macOS has no setsid).
-              nohup sh -lc "$CMDSTR" > "$STATE_DIR/$NAME.log" 2>&1 < /dev/null &
+              nohup sh -lc "$FULL" > "$STATE_DIR/$NAME.log" 2>&1 < /dev/null &
               echo "$!" > "$STATE_DIR/$NAME.pid"
               echo "$NAME"
               exit 0
             fi
-            sh -lc "$CMDSTR"
+            sh -lc "$FULL"
             exit $?
             ;;
           rm)
@@ -119,24 +127,37 @@ def fake_docker(tmp_path: Path) -> str:
             exit 0
             ;;
           logs)
-            # docker logs -f --tail 0 NAME — read the captured log if any.
+            # docker logs -f --tail 0 NAME — follow the captured log.
             NAME=""
+            FOLLOW=""
             while [ "$#" -gt 0 ]; do
               case "$1" in
-                -f) shift ;;
+                -f) FOLLOW="1"; shift ;;
                 --tail) shift 2 ;;
                 *) NAME="$1"; shift ;;
               esac
             done
-            if [ -f "$STATE_DIR/$NAME.log" ]; then
-              cat "$STATE_DIR/$NAME.log"
-            fi
-            # Block until the fake container exits (like a real log follow).
-            if [ -f "$STATE_DIR/$NAME.pid" ]; then
-              PID="$(cat "$STATE_DIR/$NAME.pid")"
-              while kill -0 "$PID" 2>/dev/null; do sleep 0.1; done
-            else
-              sleep 300
+            LOG="$STATE_DIR/$NAME.log"
+            # Wait briefly for the log file to appear.
+            i=0
+            while [ ! -f "$LOG" ] && [ "$i" -lt 50 ]; do
+              sleep 0.05
+              i=$((i + 1))
+            done
+            if [ -n "$FOLLOW" ] && [ -f "$LOG" ]; then
+              # Follow until the container exits.
+              tail -n +1 -f "$LOG" &
+              TAILPID=$!
+              if [ -f "$STATE_DIR/$NAME.pid" ]; then
+                PID="$(cat "$STATE_DIR/$NAME.pid")"
+                while kill -0 "$PID" 2>/dev/null; do sleep 0.05; done
+              else
+                sleep 1
+              fi
+              kill "$TAILPID" 2>/dev/null
+              wait "$TAILPID" 2>/dev/null
+            elif [ -f "$LOG" ]; then
+              cat "$LOG"
             fi
             exit 0
             ;;
@@ -312,3 +333,104 @@ class TestLadderWithContainerRuntime:
             set_runtime(None)
         assert result["passed"] is False
         assert result["results"][0]["status"] == "fail"
+
+    def test_render_rung_starts_dev_and_reads_logs(self, fake_docker, tmp_path):
+        """P1-3: ladder with a dev section must start_process and capture logs."""
+        import json
+        import socket
+
+        from agent.build_runtime import get_runtime
+        from agent.build_session import stop_all_sessions
+        from tools.verify_tool import verify
+
+        # Free high port for the fake http.server.
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        (tmp_path / "burooj.build.json").write_text(
+            json.dumps({
+                "typecheck": "echo types-ok",
+                "dev": {
+                    "command": (
+                        f'python3 -c "import os; from http.server import '
+                        f'HTTPServer, SimpleHTTPRequestHandler; '
+                        f'HTTPServer((\'127.0.0.1\', int(os.environ[\'PORT\'])), '
+                        f'SimpleHTTPRequestHandler).serve_forever()"'
+                    ),
+                    "port": port,
+                    "ready": "/",
+                },
+                "routes": ["/"],
+            }),
+            encoding="utf-8",
+        )
+        (tmp_path / "index.html").write_text("<html><body>ok</body></html>", encoding="utf-8")
+
+        rt = make_runtime(fake_docker)
+        set_runtime(rt)
+        try:
+            result = verify(workspace=tmp_path, rungs=["typecheck", "render"])
+            by_name = {r["name"]: r for r in result["results"]}
+            assert by_name["typecheck"]["status"] == "pass"
+            assert by_name["render"]["status"] == "pass", by_name["render"]
+            # Dev server was started under the container runtime; logs path used.
+            assert result["passed"] is True
+        finally:
+            stop_all_sessions()
+            set_runtime(None)
+            get_runtime()
+
+
+class TestDockerLogCapture:
+    def test_logs_land_once_without_duplication(self, fake_docker, tmp_path):
+        """H4: one log follower; stdout is not mirrored into stderr."""
+        import time
+
+        rt = make_runtime(fake_docker)
+        # Print markers, then sleep so the follower can attach.
+        handle = rt.start_process(
+            "sh -c 'echo OUT_MARKER; echo ERR_MARKER 1>&2; sleep 2'",
+            tmp_path,
+        )
+        try:
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                outs = list(handle.stdout_lines)
+                if any("OUT_MARKER" in line for line in outs):
+                    break
+                time.sleep(0.05)
+            time.sleep(0.3)
+            outs = list(handle.stdout_lines)
+            errs = list(handle.stderr_lines)
+            assert any("OUT_MARKER" in line for line in outs), outs
+            # No line should appear in both lists (the old bug duplicated
+            # every line into stderr_lines from a second docker logs -f).
+            both = set(outs) & set(errs)
+            assert not both, f"duplicated lines across streams: {both}"
+            combined = outs + errs
+            assert combined.count("OUT_MARKER") == 1
+            assert sum(1 for line in combined if "ERR_MARKER" in line) == 1
+        finally:
+            rt.stop_process(handle)
+
+    def test_chatty_logs_do_not_block(self, fake_docker, tmp_path):
+        """H4: draining both pipes keeps a chatty process from wedging."""
+        import time
+
+        rt = make_runtime(fake_docker)
+        cmd = (
+            "sh -c 'i=0; while [ $i -lt 200 ]; do echo line-$i; "
+            "i=$((i+1)); done; sleep 1'"
+        )
+        handle = rt.start_process(cmd, tmp_path)
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and not any(
+                "line-199" in line for line in handle.stdout_lines
+            ):
+                time.sleep(0.05)
+            assert any("line-199" in line for line in handle.stdout_lines)
+        finally:
+            rt.stop_process(handle)

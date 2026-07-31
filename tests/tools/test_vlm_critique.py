@@ -52,6 +52,32 @@ class TestParseVisionResponse:
         assert len(parsed["issues"]) == 1
         assert parsed["issues"][0]["point"] == "p"
 
+    def test_real_vision_tool_envelope_unwraps_analysis(self):
+        """H2: vision_analyze_tool returns {success, analysis}, not bare issues JSON."""
+        analysis = json.dumps({
+            "issues": [
+                {"severity": "major", "point": "low contrast", "suggestion": "darken"},
+            ]
+        })
+        envelope = json.dumps({"success": True, "analysis": analysis})
+        parsed = _parse_vision_response(envelope)
+        assert parsed["issues"][0]["point"] == "low contrast"
+
+    def test_real_vision_tool_envelope_with_fenced_analysis(self):
+        analysis = (
+            "Sure:\n```json\n"
+            '{"issues": [{"severity": "minor", "point": "gap", "suggestion": "tighten"}]}\n'
+            "```"
+        )
+        envelope = json.dumps({"success": True, "analysis": analysis})
+        parsed = _parse_vision_response(envelope)
+        assert parsed["issues"][0]["point"] == "gap"
+
+    def test_vision_tool_failure_envelope_raises(self):
+        envelope = json.dumps({"success": False, "error": "provider down"})
+        with pytest.raises(ValueError, match="provider down|Vision"):
+            _parse_vision_response(envelope)
+
 
 class TestVlmCritiqueNeverBlocks:
     def test_skip_when_no_manifest(self, tmp_path):
@@ -137,6 +163,7 @@ class TestVlmCritiqueLadder:
         def exploding_critique(workspace=None, routes=None):
             raise RuntimeError("vision provider down")
 
+        monkeypatch.setenv("BUROOJ_VLM_CRITIQUE", "1")
         monkeypatch.setattr("tools.vlm_critique.vlm_critique", exploding_critique)
         write_manifest(tmp_path, {"typecheck": "true"})
         result = verify(workspace=tmp_path, rungs=["design_gate"])
@@ -161,12 +188,35 @@ class TestVlmCritiqueLadder:
                 ],
             }
 
+        monkeypatch.setenv("BUROOJ_VLM_CRITIQUE", "1")
         monkeypatch.setattr("tools.vlm_critique.vlm_critique", critical_critique)
         write_manifest(tmp_path, {"typecheck": "true"})
         result = verify(workspace=tmp_path, rungs=["design_gate"])
         assert result["passed"] is True
         output = result["results"][0]["output"]
         assert "clashing colors" in output
+
+    def test_design_gate_skips_vlm_by_default(self, tmp_path, monkeypatch):
+        """P1-1: full ladder must not call the vision API unless opted in."""
+        from tools.verify_tool import verify
+
+        called = {"n": 0}
+
+        def tracking_critique(workspace=None, routes=None):
+            called["n"] += 1
+            return {"status": "advisory", "advisory": True, "routes": []}
+
+        monkeypatch.delenv("BUROOJ_VLM_CRITIQUE", raising=False)
+        monkeypatch.setattr("tools.vlm_critique.vlm_critique", tracking_critique)
+        monkeypatch.setattr(
+            "tools.verify_tool._vlm_critique_enabled",
+            lambda: False,
+        )
+        write_manifest(tmp_path, {"typecheck": "true"})
+        result = verify(workspace=tmp_path, rungs=["design_gate"])
+        assert result["passed"] is True
+        assert called["n"] == 0
+        assert "vlm_critique" not in result["results"][0]["output"]
 
 
 class TestVlmCritiqueRegistration:

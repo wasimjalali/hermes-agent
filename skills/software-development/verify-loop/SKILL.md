@@ -74,7 +74,7 @@ Use this skill in Build mode for the tight edit-then-verify cycle. It covers whe
 - Do not run only the cheap rungs because the expensive ones are slow. Slow rungs are where real bugs live.
 - Do not fix a `fail` by deleting the step from the manifest. That turns a failure into a skip and reports green while checking less.
 - Do not ignore `error`. An unreachable dev server, an undecodable baseline or a malformed token file means you know less than you did, not more.
-- Do not treat the design gate's `skip` as approval. `a11y_check` skips when axe-core is not installed; install it. `visual_diff` skips when there is no baseline; the first run saves one.
+- Do not treat the design gate's `skip` as approval. `a11y_check` skips when axe-core is not installed; install it. `visual_diff` saves a baseline and reports `pass` with `new_baseline: true` on the first run (it does not skip).
 - Do not stop at the first green subset. The subset proves the edit; the full ladder proves the workspace.
 
 ## Verification

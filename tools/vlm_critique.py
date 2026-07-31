@@ -143,25 +143,8 @@ async def _critique_route(
     return result
 
 
-def _parse_vision_response(raw: str) -> dict[str, Any]:
-    """Best-effort parse of the vision model's reply into issues.
-
-    The model is asked for JSON but models wrap JSON in prose or fence blocks.
-    Extract the first JSON object defensively; anything unparseable yields an
-    empty issue list, which for an advisory rung is a safe default.
-    """
-    if not isinstance(raw, str):
-        return {}
-    text = raw.strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
-        return {}
-    try:
-        parsed = json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
+def _parse_issues_object(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a parsed issues dict into the clean critique shape."""
     issues = parsed.get("issues")
     if not isinstance(issues, list):
         return {}
@@ -182,6 +165,51 @@ def _parse_vision_response(raw: str) -> dict[str, Any]:
     if parsed.get("model"):
         out["model"] = str(parsed["model"])
     return out
+
+
+def _extract_json_object(text: str) -> Optional[dict[str, Any]]:
+    """Pull the outermost JSON object from *text*, or None."""
+    if not isinstance(text, str):
+        return None
+    body = text.strip()
+    start, end = body.find("{"), body.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(body[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _parse_vision_response(raw: str) -> dict[str, Any]:
+    """Parse vision_analyze_tool output into a critique issues dict.
+
+    ``vision_analyze_tool`` returns ``json.dumps({"success": bool,
+    "analysis": str})`` (or ``{"success": false, "error": ...}``). The
+    model JSON lives inside ``analysis``. Bare issues JSON is still
+    accepted so unit tests and direct callers keep working.
+    """
+    if not isinstance(raw, str):
+        return {}
+    parsed = _extract_json_object(raw)
+    if parsed is None:
+        return {}
+
+    # Real tool envelope: unwrap analysis / surface failures.
+    if "success" in parsed and ("analysis" in parsed or "error" in parsed):
+        if parsed.get("success") is False:
+            err = parsed.get("error") or "vision_analyze_tool reported success=false"
+            raise ValueError(f"Vision call failed: {err}")
+        analysis = parsed.get("analysis")
+        if not isinstance(analysis, str):
+            return {}
+        inner = _extract_json_object(analysis)
+        if inner is None:
+            return {}
+        return _parse_issues_object(inner)
+
+    return _parse_issues_object(parsed)
 
 
 async def _run_critique(session: BuildSession, routes: list[str]) -> dict[str, Any]:

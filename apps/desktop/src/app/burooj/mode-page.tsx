@@ -47,7 +47,7 @@ function persistWorkspace(path: string) {
 
 interface Rung {
   name: string
-  status: 'pass' | 'fail' | 'skip' | 'error'
+  status: 'pass' | 'fail' | 'skip' | 'error' | 'not_run'
   output?: string
   duration_ms?: number
   hint?: string
@@ -58,6 +58,71 @@ interface VerifyResult {
   passed?: boolean
   disclosure?: { workspace?: string; manifest?: string }
   error?: string
+}
+
+const ALL_RUNG_NAMES = [
+  'install',
+  'typecheck',
+  'lint',
+  'fix',
+  'guard',
+  'build',
+  'render',
+  'design_gate'
+] as const
+
+/** Fill missing rungs as not_run (never skip). skip means "manifest has no step". */
+export function buildLadderRungs(results: Rung[] | null | undefined): Rung[] {
+  return ALL_RUNG_NAMES.map(name => {
+    const found = results?.find(r => r.name === name)
+
+    return (
+      found ?? {
+        name,
+        status: 'not_run' as const,
+        output: 'Not run in this process yet. Run the ladder or verify() in a session.'
+      }
+    )
+  })
+}
+
+/**
+ * Overall ladder label. A partial run (any not_run) is never PASSED, even if
+ * the backend's gate_passed is true for the subset that ran.
+ */
+export function ladderVerdict(verifyResult: VerifyResult): 'PASSED' | 'NOT PASSED' | 'PARTIAL' {
+  const rungs = buildLadderRungs(verifyResult.results)
+  if (rungs.some(r => r.status === 'not_run')) {
+    return 'PARTIAL'
+  }
+  return verifyResult.passed === true ? 'PASSED' : 'NOT PASSED'
+}
+
+/** Merge burooj.design.checks into existing status; never drop workspace/tokens. */
+export function mergeDesignChecks(
+  prev: DesignStatus | null,
+  checks: Partial<DesignStatus> & { passed?: boolean }
+): DesignStatus {
+  const base: DesignStatus = prev ?? {
+    workspace: '',
+    tokens: { status: 'missing' },
+    contrast: {},
+    lint: {},
+    visual_diff: null,
+    a11y_check: null
+  }
+
+  return {
+    ...base,
+    workspace: base.workspace || (checks as DesignStatus).workspace || '',
+    tokens: base.tokens?.tokens || base.tokens?.status
+      ? base.tokens
+      : (checks as DesignStatus).tokens ?? base.tokens,
+    contrast: checks.contrast ?? base.contrast,
+    lint: checks.lint ?? base.lint,
+    visual_diff: checks.visual_diff !== undefined ? checks.visual_diff : base.visual_diff,
+    a11y_check: checks.a11y_check !== undefined ? checks.a11y_check : base.a11y_check
+  }
 }
 
 interface BuildStatus {
@@ -134,7 +199,8 @@ const STATUS_LABEL: Record<Rung['status'], string> = {
   pass: 'Pass',
   fail: 'Fail',
   skip: 'Skip',
-  error: 'Error'
+  error: 'Error',
+  not_run: 'Not run'
 }
 
 // Semantic state colors only: real pass/fail/error states from the Hermes
@@ -143,11 +209,14 @@ const STATUS_CLASS: Record<Rung['status'], string> = {
   pass: 'bg-(--ui-green) text-(--ui-bg-elevated)',
   fail: 'bg-(--ui-red) text-(--ui-bg-elevated)',
   skip: 'bg-(--ui-bg-quinary) text-(--ui-text-quaternary)',
-  error: 'bg-(--ui-orange) text-(--ui-bg-elevated)'
+  error: 'bg-(--ui-orange) text-(--ui-bg-elevated)',
+  not_run: 'bg-(--ui-bg-quinary) text-(--ui-text-tertiary)'
 }
 
 function StatusChip({ status }: { status: Rung['status'] | string }) {
-  const key = (['pass', 'fail', 'skip', 'error'] as const).includes(status as Rung['status'])
+  const key = (['pass', 'fail', 'skip', 'error', 'not_run'] as const).includes(
+    status as Rung['status']
+  )
     ? (status as Rung['status'])
     : 'error'
 
@@ -269,33 +338,20 @@ function ScreenshotThumb({ path, label }: { path: string; label: string }) {
 }
 
 function BuildLadder({ verifyResult }: { verifyResult: VerifyResult | null }) {
-  const results = verifyResult?.results ?? null
-
-  const allRungs: Rung[] = [
-    'install', 'typecheck', 'lint', 'fix', 'guard', 'build', 'render', 'design_gate'
-  ].map(name => {
-    const found = results?.find(r => r.name === name)
-
-    return (
-      found ?? {
-        name,
-        status: 'skip',
-        output: 'Not run in this process yet. Run the ladder or verify() in a session.'
-      }
-    )
-  })
-
   if (verifyResult?.error) {
     return <p className="text-[0.8125rem] text-(--ui-text-tertiary)">{verifyResult.error}</p>
   }
 
-  if (!results) {
+  if (!verifyResult?.results) {
     return (
       <p className="text-[0.8125rem] text-(--ui-text-quaternary)">
         No ladder run yet. Run the ladder, or ask the agent to verify() in a session.
       </p>
     )
   }
+
+  const allRungs = buildLadderRungs(verifyResult.results)
+  const verdict = ladderVerdict(verifyResult)
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -333,7 +389,7 @@ function BuildLadder({ verifyResult }: { verifyResult: VerifyResult | null }) {
         </div>
       ))}
       <p className="text-[0.75rem] font-medium">
-        Ladder: {verifyResult!.passed === true ? 'PASSED' : 'NOT PASSED'}
+        Ladder: {verdict === 'PASSED' ? 'PASSED' : verdict === 'PARTIAL' ? 'PARTIAL' : 'NOT PASSED'}
       </p>
     </div>
   )
@@ -602,11 +658,15 @@ export function DesignModePage({ requestGateway }: { requestGateway: GatewayRequ
     setRunning(true)
 
     try {
-      const result = await requestGateway<DesignStatus>('burooj.design.checks', {
-        ...(workspace ? { workspace } : {})
-      }, 300_000)
+      const result = await requestGateway<Partial<DesignStatus> & { passed?: boolean }>(
+        'burooj.design.checks',
+        {
+          ...(workspace ? { workspace } : {})
+        },
+        300_000
+      )
 
-      setStatus(result)
+      setStatus(prev => mergeDesignChecks(prev, result))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {

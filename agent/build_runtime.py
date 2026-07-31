@@ -415,6 +415,7 @@ class ContainerProcessHandle(ProcessHandle):
 
     container_id: str = ""
     _runtime: Any = field(default=None, repr=False)
+    _log_proc: Any = field(default=None, repr=False)
 
     @property
     def is_running(self) -> bool:
@@ -641,33 +642,45 @@ class DockerRuntime(Runtime):
             pid=0, command=command, _process=None, container_id=name, _runtime=self
         )
 
-        # Follow the container's logs with docker logs -f.
-        def _log_reader(kind: str, target: list[str], lock: threading.Lock) -> None:
+        # One docker logs -f process. Drain stdout and stderr of that CLI
+        # process on separate threads so a chatty stream cannot fill a pipe
+        # buffer and block. docker logs merges container streams onto its
+        # own stdout by default; stderr is the CLI's diagnostic stream.
+        # Starting two docker logs processes was the old bug: every line
+        # landed twice and one stderr pipe was never read.
+        try:
+            log_proc = subprocess.Popen(
+                [self.docker_cmd, "logs", "-f", "--tail", "0", name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"docker logs failed to start for {name}: {exc}") from exc
+        handle._log_proc = log_proc
+
+        def _drain(stream, target: list[str], lock: threading.Lock) -> None:
+            if stream is None:
+                return
             try:
-                log_proc = subprocess.Popen(
-                    [self.docker_cmd, "logs", "-f", "--tail", "0", name],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT if kind == "stdout" else subprocess.PIPE,
-                    text=True,
-                )
-                for line in iter(log_proc.stdout.readline, ""):
+                for line in iter(stream.readline, ""):
                     with lock:
                         target.append(line.rstrip("\n"))
-                log_proc.stdout.close()
+                stream.close()
             except (ValueError, OSError, AttributeError):
                 pass
 
         handle._stdout_thread = threading.Thread(
-            target=_log_reader,
-            args=("stdout", handle.stdout_lines, handle._lock),
+            target=_drain,
+            args=(log_proc.stdout, handle.stdout_lines, handle._lock),
+            daemon=True,
+        )
+        handle._stderr_thread = threading.Thread(
+            target=_drain,
+            args=(log_proc.stderr, handle.stderr_lines, handle._lock),
             daemon=True,
         )
         handle._stdout_thread.start()
-        handle._stderr_thread = threading.Thread(
-            target=_log_reader,
-            args=("stderr", handle.stderr_lines, handle._lock),
-            daemon=True,
-        )
         handle._stderr_thread.start()
         return handle
 
@@ -682,6 +695,12 @@ class DockerRuntime(Runtime):
 
     def stop_process(self, handle: ProcessHandle, timeout: int = 5) -> None:
         name = getattr(handle, "container_id", None)
+        log_proc = getattr(handle, "_log_proc", None)
+        if log_proc is not None:
+            try:
+                log_proc.terminate()
+            except (OSError, AttributeError):
+                pass
         if not name:
             return
         try:

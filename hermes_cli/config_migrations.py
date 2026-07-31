@@ -687,6 +687,44 @@ def _migrate_to_33(results: Dict[str, Any], quiet: bool) -> None:
             )
 
 
+def _migrate_to_34(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 33 → 34: seed burooj.model_hints and vlm_critique ──
+    # Existing installs never grew the burooj key because defaults are not
+    # merged at runtime. Add the section with empty model hints (caller fills
+    # real ids) and vlm_critique off so the keys are discoverable in config.yaml.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    burooj = config.get("burooj")
+    if not isinstance(burooj, dict):
+        burooj = {}
+        config["burooj"] = burooj
+        results["config_added"].append("burooj={}")
+    hints = burooj.get("model_hints")
+    if not isinstance(hints, dict):
+        burooj["model_hints"] = {"coding": "", "vision": ""}
+        results["config_added"].append("burooj.model_hints={coding:'', vision:''}")
+    else:
+        if "coding" not in hints:
+            hints["coding"] = ""
+            results["config_added"].append("burooj.model_hints.coding=''")
+        if "vision" not in hints:
+            hints["vision"] = ""
+            results["config_added"].append("burooj.model_hints.vision=''")
+    if "vlm_critique" not in burooj:
+        burooj["vlm_critique"] = False
+        results["config_added"].append("burooj.vlm_critique=false")
+    _persist_migration(config)
+    if not quiet:
+        print(
+            "  ✓ Added burooj.model_hints (coding/vision, empty until you set "
+            "them) and burooj.vlm_critique=false. Fill model_hints for Build/"
+            "Design routing; set vlm_critique true to run the advisory VLM."
+        )
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: version captured before the ladder started. Order matters: later steps may
@@ -708,6 +746,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (31, _migrate_to_31),
     (32, _migrate_to_32),
     (33, _migrate_to_33),
+    (34, _migrate_to_34),
 )
 
 

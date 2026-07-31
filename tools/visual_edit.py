@@ -47,6 +47,48 @@ class EditError(ValueError):
     """Raised when an edit cannot be applied safely. Never write on error."""
 
 
+def _escape_attr_value(value: str) -> str:
+    """Escape a value for embedding inside a JS double-quoted string."""
+    return (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+
+
+def _attr_assignment(attr: str, value: str) -> str:
+    """Render ``attr=...`` so quotes cannot close the attribute.
+
+    Plain values stay as double-quoted JSX attributes. Values that contain
+    ``"`` or ``\\`` become a JSX expression string (``attr={"..."}``), which
+    tree-sitter accepts and which cannot inject sibling attributes.
+    """
+    if '"' not in value and "\\" not in value and "\n" not in value and "\r" not in value:
+        return f'{attr}="{value}"'
+    return f'{attr}={{"{_escape_attr_value(value)}"}}'
+
+
+def _attr_value_literal(value: str) -> str:
+    """The value side only (including quotes / braces), for in-place replace."""
+    assignment = _attr_assignment("_", value)
+    # Strip the leading dummy attr name and '='.
+    return assignment[len("_="):]
+
+
+_TEXT_FORBIDDEN = frozenset("{}<>")
+
+
+def _require_safe_text(text: str) -> None:
+    """Refuse set_text values that would introduce JSX structure."""
+    bad = sorted({ch for ch in text if ch in _TEXT_FORBIDDEN})
+    if bad:
+        raise EditError(
+            f"set_text refuses characters that form JSX structure: {''.join(bad)!r}. "
+            f"Pass plain text only."
+        )
+
+
 def _reparse_ok(source: bytes) -> bool:
     """Whether *source* still parses as valid TSX."""
     try:
@@ -91,26 +133,31 @@ def _set_attr_patch(
     element: ElementInfo, source: bytes, attr: str, value: str
 ) -> tuple[bytes, str, str]:
     """Return (patched_source, old_text, new_text) for set_attr/set_class."""
+    value_lit = _attr_value_literal(value)
+    full_assignment = _attr_assignment(attr, value)
     found = _find_attribute(element, source, attr)
     if found is not None:
-        start, _end, quoted = found
+        start, end, quoted = found
         if quoted is not None:
-            new_value = f'"{value}"'
+            # Replace only the quoted value span with the new literal
+            # (quoted string or {\"...\"} expression).
             old = source[start:start + len(quoted)].decode(errors="replace")
-            patched = source[:start] + new_value.encode() + source[start + len(quoted):]
-            return patched, old, f'"{value}"'
-        # Expression value: replace the whole attribute with a quoted one.
+            # When switching from "x" to {"y\"z"}, the value span starts at
+            # the old quote; write the full new value literal there. The
+            # old end was start+len(quoted); use that span.
+            patched = source[:start] + value_lit.encode() + source[start + len(quoted):]
+            return patched, old, value_lit
+        # Expression value: replace the whole attribute with the new form.
         for name, astart, aend in element.attributes:
             if name == attr:
-                new_attr = f'{attr}="{value}"'
                 old = source[astart:aend].decode(errors="replace")
-                patched = source[:astart] + new_attr.encode() + source[aend:]
-                return patched, old, new_attr
+                patched = source[:astart] + full_assignment.encode() + source[aend:]
+                return patched, old, full_assignment
         raise EditError(f"attribute {attr!r} not found on element")
 
     # Insert a new attribute right after the tag name.
     insert_at = element.tag_byte + len(element.tag.encode())
-    new_attr = f' {attr}="{value}"'
+    new_attr = f" {full_assignment}"
     patched = source[:insert_at] + new_attr.encode() + source[insert_at:]
     return patched, "", new_attr
 
@@ -139,6 +186,7 @@ def _set_text_patch(
         raise EditError(
             f"element <{element.tag}> has no literal JSX text to replace"
         )
+    _require_safe_text(text)
     start, end = element.text_range
     old = source[start:end].decode(errors="replace")
     patched = source[:start] + text.encode() + source[end:]
@@ -235,8 +283,8 @@ def visual_edit(
         logger.exception("visual_edit failed")
         return {"error": f"visual_edit crashed: {type(exc).__name__}: {exc}"}
 
-    # Write through the same confinement the workspace tools use; a failure
-    # here means the file was not touched.
+    # Path always comes from the workspace-derived index. Write the patched
+    # bytes in place; confinement is the index, not a second workspace check.
     path.write_bytes(patched)
 
     return {

@@ -177,18 +177,11 @@ def resolve_model_for_hint(
 ) -> str:
     """Map a profile ``model_hint`` to a configured model id.
 
-    Reads ``burooj.model_hints.<hint>`` from config.yaml. Returns an empty
-    string when the hint is unset, the config section is missing, or the hint
-    is unmapped, so the caller falls back to the default model selection
-    instead of erroring.
-
-    Parameters
-    ----------
-    hint : str, optional
-        The ``ContextProfile.model_hint`` value (e.g. "coding", "vision").
-    cfg : dict, optional
-        The config dict (``burooj`` root). When None, reads
-        ``burooj.model_hints`` from the user config via the gateway loaders.
+    Reads ``burooj.model_hints.<hint>`` from *cfg*. Returns an empty string
+    when the hint is unset, *cfg* is None, the section is missing, or the
+    hint is unmapped, so the caller falls back to the default model
+    selection instead of erroring. Callers must pass *cfg* (the gateway
+    loads config and supplies it); this function never opens config files.
     """
     if not hint:
         return ""

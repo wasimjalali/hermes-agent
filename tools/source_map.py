@@ -59,17 +59,24 @@ _INTRINSIC_NAMES = frozenset({
 })
 
 
-def _oid_for_path(path: tuple[int, ...]) -> str:
-    """Stable oid for a structural path.
+class OidCollisionError(ValueError):
+    """Two elements produced the same oid. Indexing must not drop either."""
 
-    The path is a tuple of sibling indices. The oid is the first 16 hex of
-    blake2b over the dotted path, so it is short, stable and collision-safe
-    for a workspace of authored components.
+
+def _oid_for_path(
+    file_rel: str,
+    path: tuple[int, ...],
+    component: str = "",
+) -> str:
+    """Stable oid for one element in one workspace file.
+
+    Digests the workspace-relative file path, optional component name, and
+    structural sibling path. File path is required so two components with
+    the same tree shape in different files never share an oid.
     """
-    digest = hashlib.blake2b(
-        ".".join(str(i) for i in path).encode(), digest_size=8
-    ).hexdigest()
-    return digest
+    structural = ".".join(str(i) for i in path)
+    payload = f"{file_rel}\0{component}\0{structural}".encode()
+    return hashlib.blake2b(payload, digest_size=8).hexdigest()
 
 
 @dataclass
@@ -158,11 +165,19 @@ def _element_siblings(parent: Any) -> list[Any]:
     ]
 
 
-def _walk_jsx(node: Any, path: tuple[int, ...], out: list[ElementInfo], file: str, source: bytes) -> None:
+def _walk_jsx(
+    node: Any,
+    path: tuple[int, ...],
+    out: list[ElementInfo],
+    file: str,
+    source: bytes,
+    file_rel: str = "",
+    component: str = "",
+) -> None:
     """Depth-first walk over JSX elements, recording paths and byte ranges."""
     if node.type not in ("jsx_element", "jsx_self_closing_element"):
         for child in node.children:
-            _walk_jsx(child, path, out, file, source)
+            _walk_jsx(child, path, out, file, source, file_rel, component)
         return
 
     opening = None
@@ -202,7 +217,7 @@ def _walk_jsx(node: Any, path: tuple[int, ...], out: list[ElementInfo], file: st
                 break
 
     out.append(ElementInfo(
-        oid=_oid_for_path(path),
+        oid=_oid_for_path(file_rel, path, component),
         path=path,
         tag=tag_name,
         file=file,
@@ -217,7 +232,7 @@ def _walk_jsx(node: Any, path: tuple[int, ...], out: list[ElementInfo], file: st
     # Children get the path extended with their sibling index.
     siblings = _element_siblings(node)
     for index, child in enumerate(siblings):
-        _walk_jsx(child, path + (index,), out, file, source)
+        _walk_jsx(child, path + (index,), out, file, source, file_rel, component)
 
 
 def _component_functions(node: Any) -> list[Any]:
@@ -245,7 +260,7 @@ def _function_has_jsx(fn: Any) -> bool:
     return False
 
 
-def _index_file(path: Path, source: bytes) -> ComponentInfo:
+def _index_file(path: Path, source: bytes, file_rel: str) -> ComponentInfo:
     """Index one TSX file: its components and their element trees."""
     from tree_sitter_language_pack import get_parser
 
@@ -272,7 +287,15 @@ def _index_file(path: Path, source: bytes) -> ComponentInfo:
                         name = source[child.start_byte:child.end_byte].decode()
                         break
         component.name = name or component.name
-        _walk_jsx(fn, (), component.elements, str(path), source)
+        _walk_jsx(
+            fn,
+            (),
+            component.elements,
+            str(path),
+            source,
+            file_rel=file_rel,
+            component=component.name,
+        )
     return component
 
 
@@ -311,12 +334,17 @@ def build_source_index(workspace: Path, use_cache: bool = True) -> SourceIndex:
         return cached[1]
 
     index = SourceIndex(workspace=str(workspace))
+    root = Path(workspace).resolve()
     for path in files:
         try:
             source = path.read_bytes()
         except OSError:
             continue
-        component = _index_file(path, source)
+        try:
+            file_rel = path.resolve().relative_to(root).as_posix()
+        except ValueError:
+            file_rel = path.name
+        component = _index_file(path, source, file_rel=file_rel)
         if not component.elements:
             continue
         for element in component.elements:
@@ -324,11 +352,12 @@ def build_source_index(workspace: Path, use_cache: bool = True) -> SourceIndex:
                 # Custom components are indexed but their internals are not
                 # resolvable in v1; surface them so a caller can say why.
                 index.unmapped_custom.append(element.tag)
-            if element.oid in index.by_oid:
-                logger.debug(
-                    "oid collision for %s in %s", element.oid, path
+            prior = index.by_oid.get(element.oid)
+            if prior is not None:
+                raise OidCollisionError(
+                    f"oid collision for {element.oid}: "
+                    f"{prior.file}:{prior.tag} and {element.file}:{element.tag}"
                 )
-                continue
             index.by_oid[element.oid] = element
         index.components.append(component)
 

