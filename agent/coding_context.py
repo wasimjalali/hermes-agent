@@ -955,8 +955,10 @@ def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
 
 # Register Burooj mode profiles (agent/sanad/build/design) after the seam is
 # defined. Import is deferred so coding_context stays loadable without the
-# Burooj module in non-fork installs; failure is non-fatal.
-try:
+# Burooj module in non-fork installs. When the module is present, import it
+# unguarded so genuine errors (typo'd imports, syntax errors) propagate loudly
+# rather than silently unregistering all four profiles.
+import importlib.util
+
+if importlib.util.find_spec("agent.burooj_profiles") is not None:
     import agent.burooj_profiles  # noqa: F401
-except ImportError:
-    pass
