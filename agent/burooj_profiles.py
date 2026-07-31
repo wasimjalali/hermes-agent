@@ -48,9 +48,11 @@ BUILD_GUIDANCE = (
     "  4. guard tests pass (proves nothing broke)\n"
     "  5. build succeeds\n"
     "  6. render (dev server up, routes screenshot, zero console errors)\n"
-    "  7. design_gate (delegated to Design, stub until B3)\n"
+    "  7. design_gate (lint tokens, contrast, a11y, visual diff)\n"
     "Use `verify()` to run the ladder. Use `repo_map()` to understand the "
     "codebase. Use `preview()` to capture route screenshots and check for errors. "
+    "Use `sanad_search()` to look up company standards, brand guidelines, or "
+    "product requirements before guessing. "
     "Report what you verified."
 )
 
@@ -63,9 +65,9 @@ DESIGN_GUIDANCE = (
     "`build/tokens.css` and `build/tailwind.tokens.js`. "
     "Deterministic checks decide (token lint, contrast, a11y, visual diff). "
     "Vision-model critique is advisory only and never blocks. "
-    "The design gate tooling arrives in phase B3. Until then, keep decisions "
-    "in plain files the Build mode can read, and refuse one-off visual hacks "
-    "that skip the system."
+    "Use `sanad_search()` to look up brand guidelines, accessibility policies, "
+    "or design standards from the company knowledge base before making decisions. "
+    "Refuse one-off visual hacks that skip the system."
 )
 
 # ── Profiles ─────────────────────────────────────────────────────────────────

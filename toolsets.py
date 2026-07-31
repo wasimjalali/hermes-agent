@@ -384,6 +384,7 @@ TOOLSETS = {
         "tools": [
             "web_search", "web_extract",
             "read_file", "search_files",
+            "sanad_search", "sanad_get_chunk",
             "skills_list", "skill_view", "skill_manage",
             "todo", "memory",
             "session_search", "clarify",
@@ -399,6 +400,7 @@ TOOLSETS = {
             "open_preview", "focus_pane",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
+            "sanad_search", "sanad_get_chunk",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
@@ -424,6 +426,7 @@ TOOLSETS = {
             "open_preview", "focus_pane",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze", "image_generate",
+            "sanad_search", "sanad_get_chunk",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
