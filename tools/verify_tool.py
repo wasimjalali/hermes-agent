@@ -6,7 +6,7 @@ Ladder order (cheap to expensive, fail-fast):
 3. fix - tests that must flip from failing to passing
 4. guard - tests that must stay passing
 5. build - succeeds
-6. render - dev server up, routes screenshot, zero console errors
+6. render - dev server up, routes respond, zero console errors
 7. design_gate - delegated to Design profile (B3, stub)
 
 Tool schema:
@@ -17,15 +17,14 @@ Each Rung: { name: str, status: "pass"|"fail"|"skip", output: str, duration_ms: 
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from agent.build_manifest import BuildManifest, ManifestError, load_manifest
+from agent.build_runtime import get_runtime
 from agent.build_workspace import resolve_workspace
 
 logger = logging.getLogger("hermes.verify_tool")
@@ -33,11 +32,11 @@ logger = logging.getLogger("hermes.verify_tool")
 # All ladder rungs in order.
 LADDER_RUNGS = ("typecheck", "lint", "fix", "guard", "build", "render", "design_gate")
 
-# Rungs that run without the manifest's test config.
-_SIMPLE_RUNGS = {"typecheck", "lint", "build"}
-
 # Timeout for each command (seconds).
 _RUNG_TIMEOUT = 120
+
+# Timeout for the dev server to become ready during render rung.
+_RENDER_SERVER_TIMEOUT = 20
 
 
 @dataclass
@@ -58,48 +57,30 @@ class RungResult:
         }
 
 
-def _run_command(
-    command: str, cwd: Path, timeout: int = _RUNG_TIMEOUT
-) -> tuple[int, str]:
-    """Run a shell command and return (exit_code, combined output).
-
-    Never raises on command failure. Returns the exit code and output.
-    """
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        output = result.stdout
-        if result.stderr:
-            output += "\n" + result.stderr if output else result.stderr
-        return result.returncode, output.strip()
-    except subprocess.TimeoutExpired:
-        return 1, f"Command timed out after {timeout}s: {command}"
-    except OSError as exc:
-        return 1, f"Failed to run command: {exc}"
-
-
 def _run_rung_typecheck(manifest: BuildManifest, workspace: Path) -> RungResult:
     """Run the typecheck rung."""
     start = time.monotonic()
-    code, output = _run_command(manifest.typecheck, workspace)
+    runtime = get_runtime()
+    result = runtime.exec(manifest.typecheck, workspace, timeout=_RUNG_TIMEOUT)
     duration = int((time.monotonic() - start) * 1000)
-    status = "pass" if code == 0 else "fail"
-    return RungResult(name="typecheck", status=status, output=output, duration_ms=duration)
+    status = "pass" if result.ok else "fail"
+    output = result.stdout
+    if result.stderr:
+        output += "\n" + result.stderr if output else result.stderr
+    return RungResult(name="typecheck", status=status, output=output.strip(), duration_ms=duration)
 
 
 def _run_rung_lint(manifest: BuildManifest, workspace: Path) -> RungResult:
     """Run the lint rung."""
     start = time.monotonic()
-    code, output = _run_command(manifest.lint, workspace)
+    runtime = get_runtime()
+    result = runtime.exec(manifest.lint, workspace, timeout=_RUNG_TIMEOUT)
     duration = int((time.monotonic() - start) * 1000)
-    status = "pass" if code == 0 else "fail"
-    return RungResult(name="lint", status=status, output=output, duration_ms=duration)
+    status = "pass" if result.ok else "fail"
+    output = result.stdout
+    if result.stderr:
+        output += "\n" + result.stderr if output else result.stderr
+    return RungResult(name="lint", status=status, output=output.strip(), duration_ms=duration)
 
 
 def _run_rung_fix(manifest: BuildManifest, workspace: Path) -> RungResult:
@@ -112,10 +93,14 @@ def _run_rung_fix(manifest: BuildManifest, workspace: Path) -> RungResult:
     # Run only the specified test files/patterns.
     test_args = " ".join(fix_tests)
     command = f"{manifest.test.command} -- {test_args}"
-    code, output = _run_command(command, workspace)
+    runtime = get_runtime()
+    result = runtime.exec(command, workspace, timeout=_RUNG_TIMEOUT)
     duration = int((time.monotonic() - start) * 1000)
-    status = "pass" if code == 0 else "fail"
-    return RungResult(name="fix", status=status, output=output, duration_ms=duration)
+    status = "pass" if result.ok else "fail"
+    output = result.stdout
+    if result.stderr:
+        output += "\n" + result.stderr if output else result.stderr
+    return RungResult(name="fix", status=status, output=output.strip(), duration_ms=duration)
 
 
 def _run_rung_guard(manifest: BuildManifest, workspace: Path) -> RungResult:
@@ -129,39 +114,113 @@ def _run_rung_guard(manifest: BuildManifest, workspace: Path) -> RungResult:
         test_args = " ".join(guard_tests)
         command = f"{manifest.test.command} -- {test_args}"
 
-    code, output = _run_command(command, workspace)
+    runtime = get_runtime()
+    result = runtime.exec(command, workspace, timeout=_RUNG_TIMEOUT)
     duration = int((time.monotonic() - start) * 1000)
-    status = "pass" if code == 0 else "fail"
-    return RungResult(name="guard", status=status, output=output, duration_ms=duration)
+    status = "pass" if result.ok else "fail"
+    output = result.stdout
+    if result.stderr:
+        output += "\n" + result.stderr if output else result.stderr
+    return RungResult(name="guard", status=status, output=output.strip(), duration_ms=duration)
 
 
 def _run_rung_build(manifest: BuildManifest, workspace: Path) -> RungResult:
     """Run the build rung."""
     start = time.monotonic()
-    code, output = _run_command(manifest.build, workspace)
+    runtime = get_runtime()
+    result = runtime.exec(manifest.build, workspace, timeout=_RUNG_TIMEOUT)
     duration = int((time.monotonic() - start) * 1000)
-    status = "pass" if code == 0 else "fail"
-    return RungResult(name="build", status=status, output=output, duration_ms=duration)
+    status = "pass" if result.ok else "fail"
+    output = result.stdout
+    if result.stderr:
+        output += "\n" + result.stderr if output else result.stderr
+    return RungResult(name="build", status=status, output=output.strip(), duration_ms=duration)
 
 
 def _run_rung_render(manifest: BuildManifest, workspace: Path) -> RungResult:
-    """Run the render rung (dev server + route screenshots).
+    """Run the render rung: boot dev server, check routes respond, check for errors.
 
-    This is a placeholder that checks the dev server can start and serve
-    the ready route. Full Playwright integration is in preview_tool.py.
+    This is a lighter check than the full preview tool. It verifies:
+    1. The dev server starts and becomes ready.
+    2. Each declared route returns a non-error HTTP status.
+    3. No server stderr output indicates a crash.
+
+    The full Playwright screenshot capture is done by the separate preview tool.
     """
+    import urllib.error
+    import urllib.request
+
     start = time.monotonic()
-    # For the verify ladder, render just checks the build output exists
-    # or that a dev server can start. Full preview is a separate tool.
-    # For now, if build passed, render passes (the preview tool does the
-    # actual screenshot work).
-    duration = int((time.monotonic() - start) * 1000)
-    return RungResult(
-        name="render",
-        status="skip",
-        output="Render check delegated to preview tool",
-        duration_ms=duration,
+    runtime = get_runtime()
+
+    # Start the dev server.
+    env = {"PORT": str(manifest.dev.port)}
+    handle = runtime.start_process(
+        command=manifest.dev.command,
+        cwd=workspace,
+        env=env,
     )
+
+    try:
+        # Wait for the server to be ready.
+        ready = runtime.wait_for_port(
+            port=manifest.dev.port,
+            timeout=_RENDER_SERVER_TIMEOUT,
+            path=manifest.dev.ready,
+        )
+
+        if not ready:
+            stderr_lines = handle.get_stderr()
+            output = f"Dev server did not become ready within {_RENDER_SERVER_TIMEOUT}s"
+            if stderr_lines:
+                output += "\nServer stderr:\n" + "\n".join(stderr_lines[-20:])
+            duration = int((time.monotonic() - start) * 1000)
+            return RungResult(name="render", status="fail", output=output, duration_ms=duration)
+
+        # Check each route responds with a non-error status.
+        base_url = f"http://localhost:{manifest.dev.port}"
+        failures: list[str] = []
+
+        for route in manifest.routes:
+            url = f"{base_url}{route}"
+            try:
+                req = urllib.request.Request(url, method="GET")
+                resp = urllib.request.urlopen(req, timeout=10)
+                if resp.status >= 400:
+                    failures.append(f"{route}: HTTP {resp.status}")
+            except urllib.error.HTTPError as exc:
+                failures.append(f"{route}: HTTP {exc.code}")
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                failures.append(f"{route}: {exc}")
+
+        # Check server stderr for crash indicators.
+        stderr_lines = handle.get_stderr()
+        crash_indicators = [
+            line for line in stderr_lines
+            if any(word in line.lower() for word in ("error", "unhandled", "crash", "fatal", "eaddrinuse"))
+            and "deprecation" not in line.lower()
+            and "experimentalwarning" not in line.lower()
+        ]
+
+        duration = int((time.monotonic() - start) * 1000)
+
+        if failures:
+            output = "Route failures:\n" + "\n".join(failures)
+            if crash_indicators:
+                output += "\nServer errors:\n" + "\n".join(crash_indicators[-10:])
+            return RungResult(name="render", status="fail", output=output, duration_ms=duration)
+
+        if crash_indicators:
+            output = "Server errors detected:\n" + "\n".join(crash_indicators[-10:])
+            return RungResult(name="render", status="fail", output=output, duration_ms=duration)
+
+        output = f"All {len(manifest.routes)} route(s) responded OK"
+        if not handle.is_running:
+            output += " (server exited after responding)"
+        return RungResult(name="render", status="pass", output=output, duration_ms=duration)
+
+    finally:
+        runtime.stop_process(handle)
 
 
 def _run_rung_design_gate(manifest: BuildManifest, workspace: Path) -> RungResult:

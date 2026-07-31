@@ -4,6 +4,9 @@ Boots the dev server from the manifest, waits for it to be ready, then
 drives Playwright through each declared route to capture screenshots and
 collect console/network errors.
 
+The dev server's stdout/stderr are captured continuously via the Runtime
+seam so mid-session crashes surface in the tool output.
+
 Tool schema:
     preview(routes: list[str] | None = None) -> { routes: list[RouteResult], server_healthy: bool }
 
@@ -14,15 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import signal
-import subprocess
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 from agent.build_manifest import BuildManifest, ManifestError, load_manifest
+from agent.build_runtime import ProcessHandle, get_runtime
 from agent.build_workspace import resolve_workspace
 
 logger = logging.getLogger("hermes.preview_tool")
@@ -56,76 +56,6 @@ class RouteResult:
             "network_errors": self.network_errors,
             "status": self.status,
         }
-
-
-class _DevServer:
-    """Manages the dev server process lifecycle."""
-
-    def __init__(self, command: str, port: int, cwd: Path):
-        self.command = command
-        self.port = port
-        self.cwd = cwd
-        self.process: Optional[subprocess.Popen] = None
-        self.stdout_lines: list[str] = []
-        self.stderr_lines: list[str] = []
-
-    def start(self) -> None:
-        """Start the dev server process."""
-        env = os.environ.copy()
-        env["PORT"] = str(self.port)
-        env["BROWSER"] = "none"  # Prevent auto-opening browser.
-        self.process = subprocess.Popen(
-            self.command,
-            shell=True,
-            cwd=str(self.cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            preexec_fn=os.setsid,
-            env=env,
-        )
-
-    def wait_ready(self, ready_path: str, timeout: int = _SERVER_READY_TIMEOUT) -> bool:
-        """Wait for the server to respond at the ready endpoint."""
-        import urllib.request
-        import urllib.error
-
-        url = f"http://localhost:{self.port}{ready_path}"
-        deadline = time.monotonic() + timeout
-
-        while time.monotonic() < deadline:
-            try:
-                req = urllib.request.Request(url, method="HEAD")
-                resp = urllib.request.urlopen(req, timeout=2)
-                if resp.status < 500:
-                    return True
-            except (urllib.error.URLError, OSError, TimeoutError):
-                pass
-            time.sleep(0.5)
-
-        return False
-
-    def stop(self) -> None:
-        """Stop the dev server process."""
-        if self.process is not None:
-            try:
-                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                pass
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-                except (OSError, ProcessLookupError):
-                    pass
-            self.process = None
-
-    @property
-    def is_running(self) -> bool:
-        if self.process is None:
-            return False
-        return self.process.poll() is None
 
 
 async def _capture_route(
@@ -190,22 +120,32 @@ async def _run_preview(
     screenshot_dir = workspace / _PREVIEW_DIR
     screenshot_dir.mkdir(parents=True, exist_ok=True)
 
-    # Start the dev server.
-    server = _DevServer(
+    # Start the dev server via the Runtime seam (continuous stdout/stderr capture).
+    runtime = get_runtime()
+    env = {"PORT": str(manifest.dev.port)}
+    handle: ProcessHandle = runtime.start_process(
         command=manifest.dev.command,
-        port=manifest.dev.port,
         cwd=workspace,
+        env=env,
     )
-    server.start()
 
     try:
-        # Wait for server to be ready.
-        ready = server.wait_ready(manifest.dev.ready)
+        # Wait for server to be ready via the Runtime seam.
+        ready = runtime.wait_for_port(
+            port=manifest.dev.port,
+            timeout=_SERVER_READY_TIMEOUT,
+            path=manifest.dev.ready,
+        )
         if not ready:
+            # Collect whatever the server printed before dying.
+            server_stdout = handle.get_stdout()
+            server_stderr = handle.get_stderr()
             return {
                 "routes": [],
                 "server_healthy": False,
                 "error": f"Dev server did not become ready within {_SERVER_READY_TIMEOUT}s",
+                "server_stdout": server_stdout[-50:] if server_stdout else [],
+                "server_stderr": server_stderr[-50:] if server_stderr else [],
             }
 
         base_url = f"http://localhost:{manifest.dev.port}"
@@ -225,12 +165,18 @@ async def _run_preview(
 
             await browser.close()
 
+        # Collect server output captured during the run.
+        server_stdout = handle.get_stdout()
+        server_stderr = handle.get_stderr()
+
         return {
             "routes": route_results,
-            "server_healthy": server.is_running,
+            "server_healthy": handle.is_running,
+            "server_stdout": server_stdout[-100:] if server_stdout else [],
+            "server_stderr": server_stderr[-100:] if server_stderr else [],
         }
     finally:
-        server.stop()
+        runtime.stop_process(handle)
 
 
 def preview(
@@ -251,6 +197,8 @@ def preview(
     dict with keys:
         routes : list[dict] - per-route results
         server_healthy : bool - True if server was still running after capture
+        server_stdout : list[str] - last 100 lines of dev server stdout
+        server_stderr : list[str] - last 100 lines of dev server stderr
     """
     if workspace is None:
         workspace = resolve_workspace()
