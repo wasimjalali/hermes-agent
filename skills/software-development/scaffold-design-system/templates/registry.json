@@ -1,0 +1,63 @@
+{
+  "$schema": "https://ui.shadcn.com/schema/registry.json",
+  "name": "burooj-design",
+  "homepage": "",
+  "items": [
+    {
+      "name": "button",
+      "type": "registry:ui",
+      "description": "Primary action trigger. Supports variants: default, secondary, destructive, outline, ghost.",
+      "dependencies": ["@radix-ui/react-slot", "class-variance-authority"],
+      "files": ["src/components/ui/button.tsx"]
+    },
+    {
+      "name": "card",
+      "type": "registry:ui",
+      "description": "Container with header, content and footer slots.",
+      "dependencies": [],
+      "files": ["src/components/ui/card.tsx"]
+    },
+    {
+      "name": "input",
+      "type": "registry:ui",
+      "description": "Text input field with label and error states.",
+      "dependencies": [],
+      "files": ["src/components/ui/input.tsx"]
+    },
+    {
+      "name": "badge",
+      "type": "registry:ui",
+      "description": "Inline status indicator. Variants: default, secondary, destructive, outline.",
+      "dependencies": ["class-variance-authority"],
+      "files": ["src/components/ui/badge.tsx"]
+    },
+    {
+      "name": "dialog",
+      "type": "registry:ui",
+      "description": "Modal overlay for confirmations and forms.",
+      "dependencies": ["@radix-ui/react-dialog"],
+      "files": ["src/components/ui/dialog.tsx"]
+    },
+    {
+      "name": "select",
+      "type": "registry:ui",
+      "description": "Dropdown selection. Single value from a list.",
+      "dependencies": ["@radix-ui/react-select"],
+      "files": ["src/components/ui/select.tsx"]
+    },
+    {
+      "name": "avatar",
+      "type": "registry:ui",
+      "description": "User or entity image with fallback initials.",
+      "dependencies": ["@radix-ui/react-avatar"],
+      "files": ["src/components/ui/avatar.tsx"]
+    },
+    {
+      "name": "skeleton",
+      "type": "registry:ui",
+      "description": "Loading placeholder that matches content shape.",
+      "dependencies": [],
+      "files": ["src/components/ui/skeleton.tsx"]
+    }
+  ]
+}

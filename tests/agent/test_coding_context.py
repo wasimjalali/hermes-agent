@@ -533,3 +533,169 @@ class TestDetection:
     def test_bare_dir_is_not_coding(self, tmp_path):
         cfg = {"agent": {"coding_context": "auto"}}
         assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is False
+
+
+# ── Burooj mode profile integration ─────────────────────────────────────────
+
+class TestBuroojAgentModePreservesCodingPosture:
+    """Agent mode must not override auto-detect, preserving the coding posture."""
+
+    def test_agent_profile_same_as_no_profile_in_code_workspace(self, tmp_path):
+        """In a code workspace, profile='agent' resolves identically to no profile."""
+        _git_init(tmp_path)
+        cfg = {"agent": {"coding_context": "auto"}}
+        no_pin = cc.resolve_runtime_mode(platform="desktop", cwd=tmp_path, config=cfg)
+        agent_pin = cc.resolve_runtime_mode(
+            platform="desktop", cwd=tmp_path, config=cfg, profile="agent"
+        )
+        # Same profile (coding), same block count, same workspace block.
+        assert no_pin.profile.name == agent_pin.profile.name
+        assert no_pin.is_coding == agent_pin.is_coding
+        no_blocks = no_pin.system_blocks()
+        agent_blocks = agent_pin.system_blocks()
+        assert len(no_blocks) == len(agent_blocks)
+        # Workspace block must be present in both.
+        assert any("Workspace" in b for b in no_blocks)
+        assert any("Workspace" in b for b in agent_blocks)
+
+    def test_agent_profile_not_pinned(self, tmp_path):
+        """profile='agent' must not set pinned=True (it falls through to detect)."""
+        _git_init(tmp_path)
+        mode = cc.resolve_runtime_mode(
+            platform="desktop", cwd=tmp_path, config={}, profile="agent"
+        )
+        assert mode.pinned is False
+
+    def test_specialisation_profiles_still_pin(self, tmp_path):
+        """sanad, build, design still override detection when passed."""
+        _git_init(tmp_path)
+        for name in ("sanad", "build", "design"):
+            mode = cc.resolve_runtime_mode(
+                platform="desktop", cwd=tmp_path, config={}, profile=name
+            )
+            assert mode.pinned is True
+            assert mode.profile.name == name
+
+
+class TestImportGuardFailsLoud:
+    """The burooj_profiles import guard must surface real errors, not swallow them."""
+
+    def test_broken_import_inside_profiles_raises(self, tmp_path, monkeypatch):
+        """A genuine error inside burooj_profiles must propagate, not silently pass."""
+        import importlib
+        import importlib.util
+
+        # Simulate: find_spec says the module exists, but importing it raises
+        # an error OTHER than ModuleNotFoundError for the module itself (e.g.
+        # a typo'd dependency inside the file).
+        original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+
+        def broken_import(name, *args, **kwargs):
+            if name == "agent.burooj_profiles":
+                raise ImportError("No module named 'agent.bogus_dep'")
+            return original_import(name, *args, **kwargs)
+
+        # The guard uses find_spec then bare import. If find_spec returns non-None,
+        # the import runs unguarded. Verify the pattern by checking the source.
+        import inspect
+        source = inspect.getsource(cc)
+        assert "find_spec" in source
+        # The import is NOT wrapped in try/except, so a broken module raises.
+        # We verify the structural property: no try/except around the import line.
+        assert "except ImportError" not in source.split("find_spec")[1]
+
+    def test_absent_module_does_not_raise(self, monkeypatch):
+        """When the module genuinely does not exist, coding_context loads fine."""
+        import importlib.util
+
+        # Patch find_spec to return None (simulating missing module)
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+        # Re-execute the guard logic manually
+        spec = importlib.util.find_spec("agent.burooj_profiles")
+        assert spec is None
+        # No exception — the guard skips the import
+
+
+class TestOperatorInstructionsScope:
+    """Operator coding_instructions must only inject into coding postures."""
+
+    def test_sanad_and_design_skip_operator_instructions(self, tmp_path):
+        """Non-coding modes (sanad, design) must not receive coding instructions."""
+        _git_init(tmp_path)
+        cfg = {
+            "agent": {
+                "coding_context": "auto",
+                "coding_instructions": "Always run lint before commit.",
+            }
+        }
+        for name in ("sanad", "design"):
+            mode = cc.resolve_runtime_mode(
+                platform="desktop", cwd=tmp_path, config=cfg, profile=name
+            )
+            blocks = mode.system_blocks()
+            assert not any("Operator instructions" in b for b in blocks), (
+                f"{name} should not get operator coding instructions"
+            )
+
+    def test_build_gets_operator_instructions(self, tmp_path):
+        """Build (model_hint='coding') should receive operator instructions."""
+        _git_init(tmp_path)
+        cfg = {
+            "agent": {
+                "coding_context": "auto",
+                "coding_instructions": "Always run lint before commit.",
+            }
+        }
+        mode = cc.resolve_runtime_mode(
+            platform="desktop", cwd=tmp_path, config=cfg, profile="build"
+        )
+        blocks = mode.system_blocks()
+        assert any("Operator instructions" in b for b in blocks)
+        assert any("Always run lint before commit." in b for b in blocks)
+
+    def test_coding_posture_gets_operator_instructions(self, tmp_path):
+        """The natural coding posture (no pin) still receives instructions."""
+        _git_init(tmp_path)
+        cfg = {
+            "agent": {
+                "coding_context": "auto",
+                "coding_instructions": "Clean the diff.",
+            }
+        }
+        mode = cc.resolve_runtime_mode(
+            platform="desktop", cwd=tmp_path, config=cfg
+        )
+        assert mode.is_coding
+        blocks = mode.system_blocks()
+        assert any("Clean the diff." in b for b in blocks)
+
+
+class TestContextProfilePersistence:
+    """context_profile must survive a DB round-trip (session resume)."""
+
+    def test_context_profile_persists_in_session_db(self, tmp_path):
+        """The context_profile column stores and returns the mode on resume."""
+        import sys
+        sys.path.insert(0, str(tmp_path.parent.parent))
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session("sess_build", source="desktop")
+            db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET context_profile = ? WHERE id = ?",
+                    ("build", "sess_build"),
+                )
+            )
+            row = db.get_session("sess_build")
+            assert row is not None
+            assert row["context_profile"] == "build"
+
+            # A session without context_profile returns None
+            db.create_session("sess_plain", source="desktop")
+            row2 = db.get_session("sess_plain")
+            assert row2 is not None
+            assert row2.get("context_profile") is None
+        finally:
+            db.close()

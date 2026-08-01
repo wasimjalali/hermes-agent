@@ -1,0 +1,18 @@
+{
+  "_comment": "Use this variant once the project actually has a test script. 'fix' holds the tests that prove the current change works and must flip from failing to passing. 'guard' holds tests that must stay passing; leave it empty to run the whole suite as the guard.",
+  "install": "npm ci",
+  "typecheck": "npx tsc --noEmit",
+  "lint": "npm run lint",
+  "test": {
+    "command": "npm test",
+    "fix": [],
+    "guard": []
+  },
+  "build": "npm run build",
+  "dev": {
+    "command": "npm run dev",
+    "port": 3000,
+    "ready": "/"
+  },
+  "routes": ["/"]
+}

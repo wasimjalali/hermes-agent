@@ -2993,8 +2993,27 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Burooj mode model routing. Maps a ContextProfile.model_hint to a model
+    # id. "coding" serves Build mode, "vision" serves Design mode. An empty
+    # value (or an unmapped hint) falls back to the default model selection.
+    # Schema version 34 introduced this section; defaults are merged at read
+    # time and documented in the commented burooj template save_config writes.
+    # Fill real model ids for your provider. Example:
+    #   burooj:
+    #     model_hints:
+    #       coding: "anthropic/claude-sonnet-4-5"
+    #       vision: "openrouter/google/gemini-2.5-flash"
+    #     vlm_critique: false   # set true to run advisory VLM in design_gate
+    "burooj": {
+        "model_hints": {
+            "coding": "",
+            "vision": "",
+        },
+        "vlm_critique": False,
+    },
+
     # Config schema version - bump this when adding new required fields
-    "_config_version": 33,
+    "_config_version": 34,
 }
 
 # Optional environment variables that enhance functionality

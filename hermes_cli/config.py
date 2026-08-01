@@ -3378,6 +3378,10 @@ _FALLBACK_COMMENT = """
 #   model: anthropic/claude-sonnet-4
 """
 
+# Burooj fork addition. Text lives in hermes_cli/burooj_config.py so this
+# shared module stays close to upstream; see that file for why.
+from hermes_cli.burooj_config import BUROOJ_COMMENT as _BUROOJ_COMMENT
+
 
 _COMMENTED_SECTIONS = """
 # ── Security ──────────────────────────────────────────────────────────
@@ -3408,6 +3412,16 @@ _COMMENTED_SECTIONS = """
 # fallback_model:
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
+
+# ── Burooj mode routing ───────────────────────────────────────────────
+# Build ("coding") and Design ("vision") model overrides. Empty hints fall
+# back to the default model. vlm_critique is opt-in advisory only.
+#
+# burooj:
+#   model_hints:
+#     coding: ""
+#     vision: ""
+#   vlm_critique: false
 """
 
 
@@ -3516,6 +3530,9 @@ def save_config(
             fb_is_valid = bool(fb.get("provider") and fb.get("model"))
         if not fb_is_valid:
             parts.append(_FALLBACK_COMMENT)
+        burooj = normalized.get("burooj")
+        if not burooj:
+            parts.append(_BUROOJ_COMMENT)
 
         atomic_yaml_write(
             config_path,

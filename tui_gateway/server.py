@@ -275,6 +275,13 @@ _LONG_HANDLERS = frozenset(
         "shell.exec",
         "skills.manage",
         "slash.exec",
+        # Burooj Build/Design panels. verify and preview run real commands and
+        # browser boots (minutes on a cold build); design.checks boots the dev
+        # server and Playwright. Keep them off the reader thread so the panel
+        # cannot freeze prompt.submit / session.interrupt behind it.
+        "burooj.build.verify",
+        "burooj.build.preview",
+        "burooj.design.checks",
     }
 )
 
@@ -1963,6 +1970,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                if profile := current.get("context_profile"):
+                    kw["context_profile"] = profile
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -2482,6 +2491,15 @@ def _ensure_session_db_row(session: dict) -> None:
             # means the launch/default profile (matches run_agent's convention).
             profile_name=Path(profile_home).name if profile_home else None,
         )
+        # Burooj mode profile: persist so session.resume restores the posture.
+        ctx_profile = session.get("context_profile")
+        if ctx_profile and hasattr(db, "_execute_write"):
+            db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET context_profile = ? WHERE id = ?",
+                    (ctx_profile, key),
+                )
+            )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
     finally:
@@ -3723,7 +3741,7 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
-def _load_enabled_toolsets() -> list[str] | None:
+def _load_enabled_toolsets(context_profile: str | None = None) -> list[str] | None:
     explicit = [
         item.strip()
         for item in os.environ.get("HERMES_TUI_TOOLSETS", "").split(",")
@@ -3732,17 +3750,18 @@ def _load_enabled_toolsets() -> list[str] | None:
     cfg = None
     fallback_notice = None
 
-    # Coding posture (base Hermes): with no explicit pin, collapse to the
-    # coding toolset (+ enabled MCP servers) when sitting in a code workspace.
-    # The desktop app and `hermes --tui` both land here. See
-    # agent/coding_context.py. No config is loaded yet at this point, so we let
-    # coding_selection() load it lazily (cli.py passes its already-resolved
-    # CLI_CONFIG instead, purely to avoid a redundant read).
+    # Coding / Burooj posture: with no explicit pin, collapse to the profile
+    # toolset (+ enabled MCP servers) when sitting in a code workspace or when
+    # a Burooj mode profile is pinned on the session. The desktop app and
+    # `hermes --tui` both land here. See agent/coding_context.py.
     if not explicit:
         try:
             from agent.coding_context import coding_selection
 
-            selection = coding_selection(platform=_resolve_session_platform())
+            selection = coding_selection(
+                platform=_resolve_session_platform(),
+                profile=context_profile,
+            )
             if selection is not None:
                 # Fold in `project` here too: this is a GUI-only resolver, and
                 # the focus-mode coding posture returns before the fallback path
@@ -4708,6 +4727,14 @@ def _session_info(agent, session: dict | None = None) -> dict:
         if isinstance(session, dict) and session.get("profile_home")
         else _current_profile_name(),
     }
+    # Burooj mode profile pinned on this session (agent/sanad/build/design).
+    context_profile = None
+    if isinstance(session, dict):
+        context_profile = session.get("context_profile") or None
+    if not context_profile and agent is not None:
+        context_profile = getattr(agent, "context_profile", None) or None
+    if context_profile:
+        info["context_profile"] = str(context_profile)
     try:
         from hermes_cli import __version__, __release_date__
 
@@ -5557,6 +5584,7 @@ def _agent_fallback_model(agent):
 
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
+    context_profile = getattr(agent, "context_profile", None) or None
 
     return {
         "base_url": getattr(agent, "base_url", None) or None,
@@ -5568,7 +5596,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
-        or _load_enabled_toolsets(),
+        or _load_enabled_toolsets(context_profile=context_profile),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -5739,6 +5767,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            context_profile=session.get("context_profile") or None,
         )
     finally:
         _clear_session_context(tokens)
@@ -5896,6 +5925,29 @@ def _resolve_runtime_with_fallback(
         raise
 
 
+def _resolve_burooj_hint_model(context_profile: str | None) -> str:
+    """Model id a pinned Burooj profile's ``model_hint`` maps to, or "".
+
+    Reads ``burooj.model_hints.<hint>`` from config. Returns an empty string
+    when the profile is unknown, has no hint, or the hint is unmapped, so the
+    caller falls back to the default model selection. Never raises: mode
+    routing must not break session creation over a config typo.
+    """
+    if not context_profile:
+        return ""
+    try:
+        from agent.burooj_profiles import resolve_model_for_hint
+        from agent.coding_context import get_profile
+
+        profile = get_profile(context_profile)
+        hint = profile.model_hint
+        if not hint:
+            return ""
+        return resolve_model_for_hint(hint, _load_cfg())
+    except Exception:
+        return ""
+
+
 def _make_agent(
     sid: str,
     key: str,
@@ -5906,6 +5958,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    context_profile: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -6024,6 +6077,15 @@ def _make_agent(
             model = model_override
         if provider_override:
             requested_provider = provider_override
+        elif not (isinstance(model_override, str) and model_override):
+            # Burooj mode routing: a pinned profile's model_hint ("coding" for
+            # Build, "vision" for Design) maps to a configured model id under
+            # config `burooj.model_hints`. An explicit per-session model pick
+            # above always wins; a missing or unmapped hint falls back to the
+            # default model selection rather than erroring.
+            hinted = _resolve_burooj_hint_model(context_profile)
+            if hinted:
+                model = hinted
         resolution = _resolve_runtime_with_fallback({
             "requested": requested_provider,
             "target_model": model or None,
@@ -6034,7 +6096,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6060,7 +6122,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=_load_enabled_toolsets(context_profile=context_profile),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -6081,6 +6143,43 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    # Per-session Burooj mode profile. system_prompt + compact skills read this
+    # via getattr so resolve_runtime_mode(profile=...) pins the posture.
+    if context_profile:
+        setattr(agent, "context_profile", context_profile)
+    return agent
+
+
+def _pin_build_workspace(agent, session: dict):
+    """Confine writes to the Build workspace for the duration of one turn.
+
+    Returns a token for :func:`_unpin_build_workspace`, or None when the
+    session is not in Build mode (every other mode is unaffected).
+    """
+    if getattr(agent, "context_profile", None) != "build":
+        return None
+    try:
+        from agent.build_workspace import resolve_workspace, set_active_workspace
+    except ImportError:
+        return None
+    try:
+        cwd = session.get("explicit_cwd") or session.get("cwd")
+        return set_active_workspace(resolve_workspace(cwd))
+    except Exception:
+        logger.warning("Could not pin Build workspace; writes stay unconfined", exc_info=True)
+        return None
+
+
+def _unpin_build_workspace(token) -> None:
+    """Release a :func:`_pin_build_workspace` pin."""
+    if token is None:
+        return
+    try:
+        from agent.build_workspace import reset_active_workspace
+
+        reset_active_workspace(token)
+    except ImportError:
+        pass
 
 
 def _init_session(
@@ -6120,6 +6219,8 @@ def _init_session(
             # launch profile. SessionBranch copies the parent's value so the
             # child stays on the same state.db.
             "profile_home": profile_home,
+            # Burooj mode profile carried from parent agent on branch/resume.
+            "context_profile": getattr(agent, "context_profile", None) or None,
             # Per-session model override set by an in-session /model switch.
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
@@ -7173,6 +7274,7 @@ def _lazy_resume_info(
     model: str = "",
     provider: str = "",
     profile: str | None = None,
+    context_profile: str | None = None,
 ) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
@@ -7189,6 +7291,8 @@ def _lazy_resume_info(
     }
     if provider:
         info["provider"] = provider
+    if context_profile:
+        info["context_profile"] = context_profile
     return info
 
 
@@ -7206,6 +7310,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    context_profile: str | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -7218,6 +7323,7 @@ def _deferred_session_record(
         "close_on_disconnect": close_on_disconnect,
         "active_session_lease": lease,
         "cols": cols,
+        "context_profile": context_profile,
         "created_at": now,
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
@@ -9127,7 +9233,14 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-            result = agent.run_conversation(run_message, **run_kwargs)
+            # Burooj Build mode confines file writes to its workspace. The pin
+            # is a ContextVar, so it must be set on the thread that actually
+            # runs the turn, not where the agent was constructed.
+            _ws_token = _pin_build_workspace(agent, session)
+            try:
+                result = agent.run_conversation(run_message, **run_kwargs)
+            finally:
+                _unpin_build_workspace(_ws_token)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -13212,6 +13325,7 @@ def _browser_disconnect(rid) -> dict:
 # Imported at the end of this module so every global the handlers close
 # over already exists; register() rebinds them onto this namespace.
 from . import (  # noqa: E402
+    methods_burooj as _methods_burooj,
     methods_complete as _methods_complete,
     methods_config as _methods_config,
     methods_prompt as _methods_prompt,
@@ -13220,6 +13334,7 @@ from . import (  # noqa: E402
 )
 
 for _m in (
+    _methods_burooj,
     _methods_session,
     _methods_prompt,
     _methods_config,

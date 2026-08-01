@@ -1,0 +1,11 @@
+{
+  "_comment": "Design-lint exemptions. The default create-next-app page.tsx ships arbitrary Tailwind values and raw hex, so it is exempt until you replace it with your own content. Delete that entry as soon as you do, or the gate stops watching your real homepage.",
+  "paths": [
+    "src/app/page.tsx"
+  ],
+  "rules": {
+    "arbitrary-tailwind": [
+      "src/components/ui/**"
+    ]
+  }
+}

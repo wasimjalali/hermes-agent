@@ -687,6 +687,17 @@ def _migrate_to_33(results: Dict[str, Any], quiet: bool) -> None:
             )
 
 
+# ── Version 33 → 34: burooj.model_hints + vlm_critique schema defaults ──
+# DEFAULT_CONFIG gained a burooj section (empty coding/vision hints, VLM
+# critique off). No write is needed: load_config() deep-merges those defaults
+# at read time, and _persist_migration forbids materialising pure schema
+# defaults to disk (they would be stripped by save_config anyway). Discover
+# the keys in a generated config.yaml via the commented burooj template block
+# that save_config appends. Fill real model ids with
+# `hermes config set burooj.model_hints.coding <id>` (and .vision).
+# (No registry entry: this version bump has no migration step.)
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: version captured before the ladder started. Order matters: later steps may

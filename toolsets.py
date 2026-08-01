@@ -369,6 +369,84 @@ TOOLSETS = {
         # non-configurable-toolset recovery loop in hermes_cli/tools_config.py).
         "posture": True,
     },
+
+    # Burooj product modes (Agent · Sanad · Build · Design). Selected per
+    # session via ContextProfile; see agent/burooj_profiles.py. posture=True
+    # so hermes tools config recovery does not swallow them into platform lists.
+    "burooj_agent": {
+        "description": "Burooj Agent mode: full Hermes coworker default toolset",
+        "tools": list(_HERMES_CORE_TOOLS),
+        "includes": [],
+        "posture": True,
+    },
+    "burooj_sanad": {
+        "description": "Burooj Sanad mode: knowledge-first (read, search, web, memory, todo)",
+        "tools": [
+            "web_search", "web_extract",
+            "read_file", "search_files",
+            "sanad_search", "sanad_get_chunk",
+            "skills_list", "skill_view", "skill_manage",
+            "todo", "memory",
+            "session_search", "clarify",
+        ],
+        "includes": [],
+        "posture": True,
+    },
+    "burooj_build": {
+        "description": "Burooj Build mode: code, run, ship (no image-gen/tts/HA/messaging)",
+        "tools": [
+            "web_search", "web_extract",
+            "terminal", "process", "read_terminal", "close_terminal",
+            "open_preview", "focus_pane",
+            "read_file", "write_file", "patch", "search_files",
+            "vision_analyze",
+            "sanad_search", "sanad_get_chunk",
+            # Burooj Build harness (B2). repo_map orients, verify gates,
+            # preview proves it renders. Without these three registered the
+            # Build guidance references tools the model cannot call.
+            "repo_map", "verify", "preview",
+            "skills_list", "skill_view", "skill_manage",
+            "browser_navigate", "browser_snapshot", "browser_click",
+            "browser_type", "browser_scroll", "browser_back",
+            "browser_press", "browser_get_images",
+            "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+            "todo", "memory",
+            "session_search", "clarify",
+            "execute_code", "delegate_task",
+            "kanban_show", "kanban_list",
+            "kanban_complete", "kanban_block", "kanban_heartbeat",
+            "kanban_comment", "kanban_create", "kanban_link",
+            "kanban_unblock",
+            "kanban_attach", "kanban_attach_url", "kanban_attachments",
+        ],
+        "includes": [],
+        "posture": True,
+    },
+    "burooj_design": {
+        "description": "Burooj Design mode: system tokens/specs, browser, vision, image gen",
+        "tools": [
+            "web_search", "web_extract",
+            "terminal", "process",
+            "open_preview", "focus_pane",
+            "read_file", "write_file", "patch", "search_files",
+            "vision_analyze", "image_generate",
+            "sanad_search", "sanad_get_chunk",
+            # Burooj design gate (B3). Four deterministic checks; they also run
+            # as rung 7 of the Build ladder, but Design owns the rules and must
+            # be able to call each one directly.
+            "design_lint", "contrast_check", "a11y_check", "visual_diff",
+            "skills_list", "skill_view", "skill_manage",
+            "browser_navigate", "browser_snapshot", "browser_click",
+            "browser_type", "browser_scroll", "browser_back",
+            "browser_press", "browser_get_images",
+            "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+            "todo", "memory",
+            "session_search", "clarify",
+            "delegate_task",
+        ],
+        "includes": [],
+        "posture": True,
+    },
     
     # ==========================================================================
     # Full Hermes toolsets (CLI + messaging platforms)

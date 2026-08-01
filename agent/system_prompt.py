@@ -314,7 +314,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             from agent.coding_context import coding_compact_skill_categories
 
             _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
+                platform=agent.platform,
+                cwd=resolve_context_cwd(),
+                profile=getattr(agent, "context_profile", None) or None,
             )
         except Exception:
             _compact_cats = frozenset()
@@ -364,6 +366,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 platform=agent.platform,
                 cwd=resolve_context_cwd(),
                 model=agent.model,
+                profile=getattr(agent, "context_profile", None) or None,
             )
             stable_parts.extend(coding_prefix_parts)
         except Exception:

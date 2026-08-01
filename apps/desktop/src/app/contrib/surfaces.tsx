@@ -167,8 +167,8 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
     <Routes>
       {/* Named product routes BEFORE :sessionId so "sanad" is not treated as a session id */}
       <Route element={page(<SanadModePage />)} path="sanad" />
-      <Route element={page(<BuildModePage />)} path="build" />
-      <Route element={page(<DesignModePage />)} path="design" />
+      <Route element={page(<BuildModePage requestGateway={actions.requestGateway} />)} path="build" />
+      <Route element={page(<DesignModePage requestGateway={actions.requestGateway} />)} path="design" />
       <Route element={page(<SkillsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="skills" />
       <Route element={page(<MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="messaging" />
       <Route element={page(<ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="artifacts" />

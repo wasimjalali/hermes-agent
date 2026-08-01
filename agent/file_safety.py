@@ -163,8 +163,37 @@ def is_write_denied(path: str) -> bool:
     return _classify_write_denial(path) is not None
 
 
+def _get_build_workspace_denial(path: str, verb: str) -> Optional[str]:
+    """Return an error when Build mode targets a path outside its workspace.
+
+    No-ops unless a Burooj Build session has pinned a workspace, so base Hermes
+    and the other three Burooj modes are unaffected. Import is deferred and
+    guarded: ``agent.build_workspace`` is fork-only, and file safety must stay
+    loadable without it.
+    """
+    try:
+        from agent.build_workspace import get_active_workspace, is_within_workspace
+    except ImportError:
+        return None
+
+    workspace = get_active_workspace()
+    if workspace is None:
+        return None
+    if is_within_workspace(Path(path), workspace):
+        return None
+    return (
+        f"{verb} denied: '{path}' is outside the Build mode workspace "
+        f"({workspace}). Build confines file changes to one workspace. Switch "
+        f"to Agent mode, or open that directory as the workspace."
+    )
+
+
 def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
     """Return a user/model-facing error when writes to ``path`` are blocked."""
+    workspace_denial = _get_build_workspace_denial(path, verb)
+    if workspace_denial is not None:
+        return workspace_denial
+
     denial = _classify_write_denial(path)
     if denial is None:
         return None

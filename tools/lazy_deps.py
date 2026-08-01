@@ -111,6 +111,23 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # users never pay this import.
     "provider.azure_identity": ("azure-identity==1.25.3",),
 
+    # ─── Burooj Build and Design (B2/B3) ───────────────────────────────────
+    # repo_map's tree-sitter parsing. Tracks the `burooj-build` extra in
+    # pyproject.toml — bump both together. Only a Build-mode session pays for
+    # this; repo_map raises TreeSitterUnavailable with this install hint when
+    # it is missing, rather than degrading to a bare filename listing.
+    "burooj.repo_map": (
+        "tree-sitter==0.25.2",
+        "tree-sitter-language-pack==0.9.0",
+    ),
+    # preview / a11y_check / visual_diff drive a real browser. Tracks the
+    # `burooj-browser` extra. Note that playwright also needs its browser
+    # binaries: `python -m playwright install chromium`.
+    "burooj.browser": (
+        "playwright==1.58.0",
+        "pillow==12.1.0",
+    ),
+
     # ─── Web search backends ───────────────────────────────────────────────
     "search.exa": ("exa-py==2.10.2",),
     "search.firecrawl": ("firecrawl-py==4.17.0",),
