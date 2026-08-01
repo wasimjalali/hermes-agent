@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -57,12 +58,36 @@ def _escape_attr_value(value: str) -> str:
     )
 
 
+# A JSX attribute name: letter/underscore/colon first, then letters, digits,
+# hyphen, underscore, dot or colon. Covers className, data-*, aria-*, and
+# namespaced names like xlink:href, and nothing else.
+_ATTR_NAME_RE = re.compile(r"^[A-Za-z_:][A-Za-z0-9_.:-]*$")
+
+
+def _require_safe_attr(attr: str) -> None:
+    """Refuse an attribute name that is not a bare JSX identifier.
+
+    The value side is escaped, but the name is spliced in as source. Without
+    this, ``attr='onClick={() => fetch("...")} data-x'`` writes a real event
+    handler and the re-parse gate accepts it, because injected JSX is valid
+    JSX. Escaping the value and not the name protects nothing.
+    """
+    if not _ATTR_NAME_RE.match(attr):
+        raise EditError(
+            f"invalid attribute name {attr!r}. Names must match "
+            f"[A-Za-z_:][A-Za-z0-9_.:-]* (for example className, data-id, "
+            f"aria-label)."
+        )
+
+
 def _attr_assignment(attr: str, value: str) -> str:
     """Render ``attr=...`` so quotes cannot close the attribute.
 
     Plain values stay as double-quoted JSX attributes. Values that contain
     ``"`` or ``\\`` become a JSX expression string (``attr={"..."}``), which
     tree-sitter accepts and which cannot inject sibling attributes.
+
+    The caller must have run :func:`_require_safe_attr` on *attr*.
     """
     if '"' not in value and "\\" not in value and "\n" not in value and "\r" not in value:
         return f'{attr}="{value}"'
@@ -230,10 +255,12 @@ def _apply_patch(
     if op in _ATTR_OPS:
         if not attr:
             raise EditError(f"{op} requires an attribute name")
+        _require_safe_attr(attr)
         patched, old, new = _set_attr_patch(element, source, attr, value)
     elif op in _REMOVE_OPS:
         if not attr:
             raise EditError("remove_attr requires an attribute name")
+        _require_safe_attr(attr)
         patched, old, new = _remove_attr_patch(element, source, attr)
     elif op in _TEXT_OPS:
         patched, old, new = _set_text_patch(element, source, value)

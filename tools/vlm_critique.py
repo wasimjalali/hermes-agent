@@ -85,9 +85,16 @@ class RouteCritique:
     error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
+        # Accept a plain dict as well as a CritiqueIssue. The parser returns
+        # dicts, and this call sits outside _critique_route's try, so a typed
+        # assumption here crashed the whole tool on any non-empty critique.
+        # An advisory rung must not be able to take the gate down.
         data: dict[str, Any] = {
             "path": self.path,
-            "issues": [i.to_dict() for i in self.issues],
+            "issues": [
+                i.to_dict() if isinstance(i, CritiqueIssue) else dict(i)
+                for i in self.issues
+            ],
         }
         if self.model:
             data["model"] = self.model
@@ -129,7 +136,26 @@ async def _critique_route(
             user_prompt=_CRITIQUE_PROMPT,
         )
         critique = _parse_vision_response(raw)
-        result.issues = critique.get("issues", [])
+        if "issues" not in critique:
+            # The reply came back but carried no issues list: prose instead of
+            # JSON, a truncated body, a differently-named key. That is "we do
+            # not know", not "the page is clean". Reporting zero issues here
+            # made an unreadable reply look like a pass.
+            result.error = "Vision reply could not be parsed into issues"
+            return result
+        # _parse_issues_object returns plain dicts; RouteCritique.to_dict
+        # calls .to_dict() on each issue. Without this conversion every
+        # critique carrying at least one issue died with an AttributeError
+        # outside this try block, so the tool only ever "worked" when the
+        # model reported nothing.
+        result.issues = [
+            CritiqueIssue(
+                severity=i.get("severity", "minor"),
+                point=i.get("point", ""),
+                suggestion=i.get("suggestion", ""),
+            )
+            for i in critique.get("issues", [])
+        ]
         result.summary = (
             f"{len(result.issues)} issue(s) reported by vision review"
         )

@@ -205,7 +205,7 @@ export function SanadKnowledgeSettings() {
               </Button>
             </label>
           }
-          description="Markdown, text, JSON and HTML. Public scope. Writes need SANAD_ADMIN_TOKEN on the API (or SANAD_ALLOW_UNAUTHENTICATED_WRITES=1 for open local). Upload stays disabled until one is set; gateway token wiring is not wired yet."
+          description="Markdown, text, JSON and HTML. Public scope. Upload, delete and sync send no admin token yet, so they only work when the API runs with SANAD_ALLOW_UNAUTHENTICATED_WRITES=1. With SANAD_ADMIN_TOKEN set they return 401 until gateway token wiring lands."
           title="Upload a document"
         />
         {uploadNote ? (

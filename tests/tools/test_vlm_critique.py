@@ -219,6 +219,81 @@ class TestVlmCritiqueLadder:
         assert "vlm_critique" not in result["results"][0]["output"]
 
 
+class TestCritiqueRoundTrip:
+    """H3: parsed issues must survive RouteCritique.to_dict()."""
+
+    def _route_with(self, raw: str):
+        """Drive _critique_route's parse branch without a browser."""
+        import asyncio
+
+        from tools import vlm_critique as vc
+
+        class FakePage:
+            async def goto(self, *a, **k):
+                return None
+
+            async def screenshot(self, *a, **k):
+                return None
+
+        async def fake_vision(image_url, user_prompt, **kwargs):
+            return raw
+
+        import tools.vision_tools as vt
+
+        original = getattr(vt, "vision_analyze_tool", None)
+        vt.vision_analyze_tool = fake_vision
+        try:
+            return asyncio.run(
+                vc._critique_route(FakePage(), "http://x", "/", Path("/tmp"))
+            )
+        finally:
+            if original is not None:
+                vt.vision_analyze_tool = original
+
+    def test_issues_serialize_instead_of_raising(self):
+        """A critique with one issue used to die with AttributeError.
+
+        _parse_issues_object returns plain dicts; RouteCritique.to_dict calls
+        .to_dict() on each. The crash landed outside _critique_route's try,
+        so vlm_critique only ever succeeded on an empty critique.
+        """
+        inner = (
+            '{"issues": [{"severity": "major", "point": "low contrast", '
+            '"suggestion": "darken"}]}'
+        )
+        result = self._route_with(json.dumps({"success": True, "analysis": inner}))
+        assert result.error == "", result.error
+        data = result.to_dict()
+        assert data["issues"] == [
+            {"severity": "major", "point": "low contrast", "suggestion": "darken"}
+        ]
+
+    def test_unparseable_reply_is_an_error_not_a_clean_bill(self):
+        """M1: prose instead of JSON is 'we do not know', not 'zero issues'."""
+        result = self._route_with(
+            json.dumps({"success": True, "analysis": "The page looks fine."})
+        )
+        assert result.issues == []
+        assert "could not be parsed" in result.error
+
+    def test_to_dict_survives_raw_dict_issues(self):
+        """to_dict sits outside the try, so it must not assume the type."""
+        from tools.vlm_critique import RouteCritique
+
+        rc = RouteCritique(path="/")
+        rc.issues = [{"severity": "minor", "point": "p", "suggestion": "s"}]
+        assert rc.to_dict()["issues"] == [
+            {"severity": "minor", "point": "p", "suggestion": "s"}
+        ]
+
+    def test_empty_issue_list_is_a_real_clean_result(self):
+        result = self._route_with(
+            json.dumps({"success": True, "analysis": '{"issues": []}'})
+        )
+        assert result.error == ""
+        assert result.to_dict()["issues"] == []
+
+
 class TestVlmCritiqueOptInCache:
     """The config read is cached on config.yaml's mtime, not loaded once."""
 

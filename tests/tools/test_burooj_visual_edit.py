@@ -165,6 +165,55 @@ class TestSourceIndex:
         assert len(index.by_oid) == 4
         assert len(set(index.by_oid)) == 4
 
+    @pytest.mark.parametrize(
+        "label,body",
+        [
+            (
+                "list_map",
+                "export default function A({ items }: any) {\n"
+                "  return <ul>{items.map((i: any) => <li key={i}>{i}</li>)}</ul>\n"
+                "}\n",
+            ),
+            (
+                "early_return",
+                "export default function A({ x }: any) {\n"
+                "  if (!x) return <p>none</p>\n"
+                "  return <div>ok</div>\n"
+                "}\n",
+            ),
+            (
+                "loading_guard",
+                "export default function A({ loading }: any) {\n"
+                "  if (loading) return <span>Loading</span>\n"
+                "  return <section><h2>Done</h2></section>\n"
+                "}\n",
+            ),
+        ],
+    )
+    def test_multiple_jsx_roots_do_not_collide(self, tmp_path, label, body):
+        """Ordinary React puts several JSX roots at structural path ().
+
+        A .map callback, an early return and a loading guard each produce a
+        second root. Digesting only file + component + path gave them all the
+        same oid, and the collision raise then aborted the whole workspace
+        index. The root ordinal is what keeps them distinct.
+        """
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        (src / "page.tsx").write_text(body, encoding="utf-8")
+
+        index = build_source_index(tmp_path, use_cache=False)
+
+        assert len(index.by_oid) >= 2, f"{label}: elements were dropped"
+        assert len(set(index.by_oid)) == len(index.by_oid)
+        roots = {e.root for e in index.by_oid.values()}
+        assert len(roots) >= 2, f"{label}: roots were not distinguished"
+
+    def test_root_ordinal_is_in_the_digest(self):
+        assert _oid_for_path("src/a.tsx", (), "A", 0) != _oid_for_path(
+            "src/a.tsx", (), "A", 1
+        )
+
     def test_true_oid_collision_raises(self, tmp_path, monkeypatch):
         """A genuine digest collision after file is in the hash must raise."""
         from tools import source_map as sm
@@ -281,6 +330,48 @@ class TestVisualEdit:
         assert "onClick" not in attr_names
         assert "data-y" not in attr_names
         assert "className" in attr_names
+
+    @pytest.mark.parametrize(
+        "attr",
+        [
+            'onClick={() => fetch("http://evil.test")} data-x',
+            'dangerouslySetInnerHTML={{__html: "<img src=x onerror=alert(1)>"}} z',
+            'a="1" onMouseOver={alert}',
+            "class>text<b",
+            "has space",
+        ],
+    )
+    def test_set_attr_refuses_injected_attribute_names(self, tmp_path, attr):
+        """H2: the value was escaped, the name was spliced in as source.
+
+        Escaping one side and not the other protects nothing: the re-parse
+        gate accepts the result because injected JSX is valid JSX.
+        """
+        make_workspace(tmp_path)
+        index = build_source_index(tmp_path)
+        h1 = next(e for e in index.by_oid.values() if e.tag == "h1")
+        with pytest.raises(EditError, match="invalid attribute name"):
+            _apply_patch(index, h1.oid, "set_attr", attr, "1")
+
+    @pytest.mark.parametrize(
+        "attr", ["className", "data-testid", "aria-label", "xlink:href", "_x"]
+    )
+    def test_set_attr_accepts_real_attribute_names(self, tmp_path, attr):
+        make_workspace(tmp_path)
+        index = build_source_index(tmp_path)
+        h1 = next(e for e in index.by_oid.values() if e.tag == "h1")
+        # An attribute already on the element is replaced in place, so `new`
+        # is just the value literal; the name only appears in the source.
+        _, _, _new, patched = _apply_patch(index, h1.oid, "set_attr", attr, "v")
+        assert attr.encode() in patched
+        assert b'"v"' in patched
+
+    def test_remove_attr_refuses_injected_names(self, tmp_path):
+        make_workspace(tmp_path)
+        index = build_source_index(tmp_path)
+        h1 = next(e for e in index.by_oid.values() if e.tag == "h1")
+        with pytest.raises(EditError, match="invalid attribute name"):
+            _apply_patch(index, h1.oid, "remove_attr", 'x} <script>y', "")
 
     def test_set_text_refuses_jsx_expression_injection(self, tmp_path):
         """H1: set_text must not splice raw JSX expressions into the tree."""

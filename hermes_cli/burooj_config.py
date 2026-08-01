@@ -4,7 +4,9 @@ This fork stays upstream-mergeable (see AGENTS.md and the mode architecture
 spec §2: "Hermes runtime, unchanged, upstream-mergeable"). Every Burooj
 addition inside a shared Hermes module is a future merge conflict, so the
 commented template lives here and ``config.py`` only imports it and appends
-it. That keeps the diff against upstream at two lines instead of seventeen.
+it. Against upstream, ``config.py`` now carries a three-line import block and
+a two-line append rather than a fifteen-line constant in the middle of the
+file, so an upstream merge has less to collide with.
 
 The keys themselves are schema defaults in ``config_defaults.DEFAULT_CONFIG``
 and are never written to disk: ``_persist_migration`` forbids materialising

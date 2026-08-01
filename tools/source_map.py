@@ -67,15 +67,21 @@ def _oid_for_path(
     file_rel: str,
     path: tuple[int, ...],
     component: str = "",
+    root: int = 0,
 ) -> str:
     """Stable oid for one element in one workspace file.
 
-    Digests the workspace-relative file path, optional component name, and
-    structural sibling path. File path is required so two components with
-    the same tree shape in different files never share an oid.
+    Digests the workspace-relative file path, optional component name, the
+    JSX root ordinal within that component, and the structural sibling path.
+
+    The file path is required so two components with the same tree shape in
+    different files never share an oid. The root ordinal is required because
+    one component routinely has several JSX roots, each at structural path
+    ``()``: an early return, a loading guard, a ``.map`` callback. Without it
+    every one of those collides, which is the common case, not an edge case.
     """
     structural = ".".join(str(i) for i in path)
-    payload = f"{file_rel}\0{component}\0{structural}".encode()
+    payload = f"{file_rel}\0{component}\0{root}\0{structural}".encode()
     return hashlib.blake2b(payload, digest_size=8).hexdigest()
 
 
@@ -98,11 +104,15 @@ class ElementInfo:
     text_range: Optional[tuple[int, int]] = None
     # True when the tag name is a capitalized (custom) component.
     custom_component: bool = False
+    # Which JSX root of its component this element descends from. A component
+    # with an early return or a .map callback has more than one.
+    root: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "oid": self.oid,
             "path": ".".join(str(i) for i in self.path),
+            "root": self.root,
             "tag": self.tag,
             "file": self.file,
             "attributes": [name for name, _, _ in self.attributes],
@@ -173,12 +183,29 @@ def _walk_jsx(
     source: bytes,
     file_rel: str = "",
     component: str = "",
+    root_counter: Optional[list[int]] = None,
+    root: int = 0,
 ) -> None:
-    """Depth-first walk over JSX elements, recording paths and byte ranges."""
+    """Depth-first walk over JSX elements, recording paths and byte ranges.
+
+    ``root_counter`` is a one-slot box shared across the walk of a single
+    component. Each JSX element found at structural path ``()`` claims the
+    next ordinal from it and passes that ordinal down to its children, so
+    a component with several roots does not give them all the same oid.
+    """
+    if root_counter is None:
+        root_counter = [0]
     if node.type not in ("jsx_element", "jsx_self_closing_element"):
         for child in node.children:
-            _walk_jsx(child, path, out, file, source, file_rel, component)
+            _walk_jsx(
+                child, path, out, file, source, file_rel, component,
+                root_counter, root,
+            )
         return
+
+    if not path:
+        root = root_counter[0]
+        root_counter[0] += 1
 
     opening = None
     for child in node.children:
@@ -217,7 +244,7 @@ def _walk_jsx(
                 break
 
     out.append(ElementInfo(
-        oid=_oid_for_path(file_rel, path, component),
+        oid=_oid_for_path(file_rel, path, component, root),
         path=path,
         tag=tag_name,
         file=file,
@@ -227,12 +254,17 @@ def _walk_jsx(
         attributes=attributes,
         text_range=text_range,
         custom_component=tag_name[:1].isupper(),
+        root=root,
     ))
 
-    # Children get the path extended with their sibling index.
+    # Children get the path extended with their sibling index, and inherit
+    # the root ordinal their subtree hangs from.
     siblings = _element_siblings(node)
     for index, child in enumerate(siblings):
-        _walk_jsx(child, path + (index,), out, file, source, file_rel, component)
+        _walk_jsx(
+            child, path + (index,), out, file, source, file_rel, component,
+            root_counter, root,
+        )
 
 
 def _component_functions(node: Any) -> list[Any]:
@@ -270,6 +302,13 @@ def _index_file(path: Path, source: bytes, file_rel: str) -> ComponentInfo:
         name=path.stem, file=str(path), start=0, end=len(source)
     )
 
+    # One counter for the whole file. Component functions are discovered
+    # nested (a .map callback is its own arrow function and inherits the
+    # enclosing component's name), so a per-function counter would restart at
+    # zero and collide with the parent's root. File scope is what makes the
+    # ordinal unique.
+    root_counter = [0]
+
     for fn in _component_functions(tree.root_node):
         if not _function_has_jsx(fn):
             continue
@@ -295,6 +334,7 @@ def _index_file(path: Path, source: bytes, file_rel: str) -> ComponentInfo:
             source,
             file_rel=file_rel,
             component=component.name,
+            root_counter=root_counter,
         )
     return component
 
