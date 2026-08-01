@@ -36,10 +36,17 @@ class TestParseVisionResponse:
     def test_empty_issues(self):
         assert _parse_vision_response('{"issues": []}')["issues"] == []
 
-    def test_invalid_severity_defaults_to_minor(self):
+    def test_off_contract_severity_is_labelled_not_rewritten(self):
+        """Was: any unknown severity became "minor".
+
+        Filing "catastrophic" as "minor" buries the strongest signal the
+        critique produced. Keep the model's word and mark it off-contract.
+        """
         raw = '{"issues": [{"severity": "catastrophic", "point": "x", "suggestion": "y"}]}'
         parsed = _parse_vision_response(raw)
-        assert parsed["issues"][0]["severity"] == "minor"
+        severity = parsed["issues"][0]["severity"]
+        assert "catastrophic" in severity
+        assert "off-contract" in severity
 
     def test_unparseable_returns_empty(self):
         assert _parse_vision_response("the page looks fine") == {}
@@ -215,8 +222,53 @@ class TestVlmCritiqueLadder:
         write_manifest(tmp_path, {"typecheck": "true"})
         result = verify(workspace=tmp_path, rungs=["design_gate"])
         assert result["passed"] is True
+        # The vision API is not called. The gate still says the rung is off,
+        # because silence read the same as "ran and found nothing".
         assert called["n"] == 0
-        assert "vlm_critique" not in result["results"][0]["output"]
+        output = result["results"][0]["output"]
+        assert "vlm_critique: ADVISORY (off" in output
+
+
+class TestSeverityHandling:
+    def test_off_contract_severity_is_kept_not_downgraded(self):
+        """A model reporting "critical" was filed as "minor".
+
+        That is the wrong direction to guess in: it hid the strongest signal
+        the critique had behind the weakest label.
+        """
+        raw = (
+            '{"issues": [{"severity": "critical", "point": "text unreadable", '
+            '"suggestion": "raise contrast"}]}'
+        )
+        issue = _parse_vision_response(raw)["issues"][0]
+        assert "critical" in issue["severity"]
+        assert issue["severity"] != "minor"
+
+    @pytest.mark.parametrize("severity", ["info", "minor", "major", "MAJOR", " major "])
+    def test_contract_severities_normalize(self, severity):
+        raw = (
+            '{"issues": [{"severity": "%s", "point": "p", "suggestion": "s"}]}'
+            % severity
+        )
+        assert _parse_vision_response(raw)["issues"][0]["severity"] == severity.strip().lower()
+
+    def test_prompt_enumerates_the_severities(self):
+        from tools.vlm_critique import _CRITIQUE_PROMPT
+
+        assert "info, minor, major" in _CRITIQUE_PROMPT
+
+
+class TestDisabledRungIsVisible:
+    def test_gate_says_when_the_critique_is_off(self, tmp_path, monkeypatch):
+        """Emitting nothing looked the same as running and finding nothing."""
+        from tools.verify_tool import verify
+
+        monkeypatch.setenv("BUROOJ_VLM_CRITIQUE", "0")
+        write_manifest(tmp_path, {"typecheck": "true"})
+        result = verify(workspace=tmp_path, rungs=["design_gate"])
+        output = result["results"][0]["output"]
+        assert "vlm_critique: ADVISORY (off" in output
+        assert "BUROOJ_VLM_CRITIQUE=1" in output
 
 
 class TestCritiqueRoundTrip:

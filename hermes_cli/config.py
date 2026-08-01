@@ -3412,16 +3412,6 @@ _COMMENTED_SECTIONS = """
 # fallback_model:
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
-
-# ── Burooj mode routing ───────────────────────────────────────────────
-# Build ("coding") and Design ("vision") model overrides. Empty hints fall
-# back to the default model. vlm_critique is opt-in advisory only.
-#
-# burooj:
-#   model_hints:
-#     coding: ""
-#     vision: ""
-#   vlm_critique: false
 """
 
 

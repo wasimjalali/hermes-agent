@@ -175,6 +175,23 @@ def _element_siblings(parent: Any) -> list[Any]:
     ]
 
 
+def _expression_has_function(node: Any) -> bool:
+    """Whether a jsx_expression subtree contains a function.
+
+    ``{items.map(i => <li/>)}`` holds an arrow function, and
+    ``_component_functions`` discovers that arrow separately and walks it.
+    Walking the container as well would index the same ``<li>`` twice under
+    two different oids, so the container walk skips these.
+    """
+    stack = list(node.children)
+    while stack:
+        current = stack.pop()
+        if current.type in ("arrow_function", "function_declaration", "function_expression"):
+            return True
+        stack.extend(current.children)
+    return False
+
+
 def _walk_jsx(
     node: Any,
     path: tuple[int, ...],
@@ -265,6 +282,18 @@ def _walk_jsx(
             child, path + (index,), out, file, source, file_rel, component,
             root_counter, root,
         )
+
+    # Elements inside an expression container are not element siblings, so
+    # the loop above never reaches them: ``{cond ? <b/> : <i/>}`` indexed as
+    # zero elements and reported nothing, which left visual_edit unable to
+    # touch a conditional branch and unable to say why. Each one becomes its
+    # own root, so it gets a distinct ordinal.
+    for child in node.children:
+        if child.type == "jsx_expression" and not _expression_has_function(child):
+            _walk_jsx(
+                child, (), out, file, source, file_rel, component,
+                root_counter, root,
+            )
 
 
 def _component_functions(node: Any) -> list[Any]:

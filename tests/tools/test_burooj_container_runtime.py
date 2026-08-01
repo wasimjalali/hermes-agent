@@ -251,6 +251,44 @@ class TestDockerExec:
         assert "pull access denied" in result.stderr
 
 
+class TestLogFollowerFailure:
+    def test_container_is_removed_when_the_follower_cannot_start(
+        self, fake_docker, tmp_path, monkeypatch
+    ):
+        """`docker run -d` has already succeeded by the time Popen runs.
+
+        Raising without cleanup left the container running with no handle to
+        stop it, holding the published port against the next attempt.
+        """
+        import subprocess as sp
+
+        rt = make_runtime(fake_docker)
+        removed: list[list[str]] = []
+        real_run_docker = rt._run_docker
+
+        def spy(args, timeout=120):
+            removed.append(list(args))
+            return real_run_docker(args, timeout=timeout)
+
+        monkeypatch.setattr(rt, "_run_docker", spy)
+
+        # Fail only the log follower. Patching Popen wholesale would break
+        # `docker version` and `docker run -d`, which is a different error.
+        real_popen = sp.Popen
+
+        def only_logs_fails(args, *a, **k):
+            if isinstance(args, (list, tuple)) and "logs" in args:
+                raise OSError("no fds left")
+            return real_popen(args, *a, **k)
+
+        monkeypatch.setattr(sp, "Popen", only_logs_fails)
+
+        with pytest.raises(RuntimeError, match="docker logs failed to start"):
+            rt.start_process("sleep 30", tmp_path, env={"PORT": "3000"})
+
+        assert any(a[:2] == ["rm", "-f"] for a in removed), removed
+
+
 class TestDockerProcess:
     def test_start_stop_and_liveness(self, fake_docker, tmp_path):
         rt = make_runtime(fake_docker)
