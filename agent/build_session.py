@@ -19,6 +19,7 @@ that case rather than guessing.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import threading
 from dataclasses import dataclass
@@ -196,3 +197,10 @@ def stop_all_sessions() -> None:
             session.stop_server()
         except Exception:  # never let cleanup mask the real error
             logger.debug("Failed to stop dev server for %s", session.workspace)
+
+
+# A dev server that outlives the interpreter holds its port, and the next run's
+# ensure_server correctly refuses to verify against a server it did not start.
+# Registering here rather than at a call site means every entry point that
+# reaches a session (verify, preview, a11y_check, visual_diff) is covered.
+atexit.register(stop_all_sessions)

@@ -233,6 +233,20 @@ def _decode_png_pixels(png_bytes: bytes) -> tuple[int, int, bytes]:
     return width, height, bytes(pixels)
 
 
+async def capture_page(page: Any) -> bytes:
+    """Screenshot the whole document, not just the viewport.
+
+    Viewport-only capture meant the gate compared the top ``_VIEWPORT_HEIGHT``
+    pixels and nothing else. On the B6 landing page that was 800 of 2234
+    pixels, so roughly two thirds of every route was outside the check whose
+    only job is noticing that something changed.
+
+    A height change now shows up as a size mismatch, which ``_compare_pixels``
+    scores 100%. That is the intended reading: the page got longer.
+    """
+    return await page.screenshot(full_page=True)
+
+
 def _compare_pixels(
     pixels_a: bytes,
     pixels_b: bytes,
@@ -335,7 +349,7 @@ async def _capture_screenshots(
                                     url, wait_until=_WAIT_UNTIL, timeout=_NAV_TIMEOUT_MS
                                 )
                                 screenshots[(route_path, breakpoint, theme)] = (
-                                    await page.screenshot(full_page=False)
+                                    await capture_page(page)
                                 )
                             except Exception as exc:
                                 logger.warning(
@@ -570,6 +584,17 @@ def _visual_diff_impl(
                 ))
 
     new_count = sum(1 for r in results if r.new_baseline)
+    drifted = sum(1 for r in results if not r.passed)
+    if drifted:
+        # The old summary read "N cell(s) within threshold" whenever no
+        # baseline was new, so a failing result carried a summary asserting
+        # everything was fine. The desktop panel reads this string.
+        summary = f"{drifted} of {len(results)} cell(s) drifted"
+    elif new_count:
+        summary = f"{len(results)} cell(s), {new_count} new baseline(s)"
+    else:
+        summary = f"{len(results)} cell(s) within threshold"
+
     result: dict[str, Any] = {
         "routes": [r.to_dict() for r in results],
         "passed": all_passed,
@@ -578,10 +603,7 @@ def _visual_diff_impl(
             "breakpoints": list(breakpoints),
             "themes": list(themes),
         },
-        "summary": (
-            f"{len(results)} cell(s), {new_count} new baseline(s)"
-            if new_count else f"{len(results)} cell(s) within threshold"
-        ),
+        "summary": summary,
     }
     if errors:
         result["error"] = "; ".join(errors)

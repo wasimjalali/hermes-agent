@@ -117,7 +117,10 @@ async def _capture_route(
     screenshot_name = route_path.strip("/").replace("/", "_") or "index"
     screenshot_path = screenshot_dir / f"{screenshot_name}.png"
     try:
-        await page.screenshot(path=str(screenshot_path), full_page=False)
+        # Full page, not the viewport. A fold-only screenshot means the
+        # model reviewing its own work sees the top 800px of a page it just
+        # built, which is where the fewest mistakes are.
+        await page.screenshot(path=str(screenshot_path), full_page=True)
         result.screenshot = str(screenshot_path)
     except Exception as exc:
         logger.warning("Screenshot failed for %s: %s", route_path, exc)

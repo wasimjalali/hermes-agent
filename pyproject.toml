@@ -179,13 +179,12 @@ burooj-build = [
   "tree-sitter==0.25.2",
   "tree-sitter-language-pack==0.9.0",
 ]
-# Burooj Build/Design browser checks (B2/B3) — preview, a11y_check and
-# visual_diff drive a real browser. Pillow is not required but makes
-# visual_diff's PNG decode roughly ten times faster; it falls back to a
-# pure-Python decoder when absent.
+# Burooj Build/Design browser checks (B2/B3): preview, a11y_check and
+# visual_diff drive a real browser. Pillow speeds visual_diff's PNG decode up
+# roughly ten times, but it is already a core dependency (see the main
+# `dependencies` list), so re-pinning it here only creates a resolver conflict.
 burooj-browser = [
   "playwright==1.58.0",
-  "pillow==12.1.0",
 ]
 tts-premium = ["elevenlabs==1.59.0"]
 voice = [

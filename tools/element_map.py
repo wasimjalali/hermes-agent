@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -104,6 +105,15 @@ _STAMP_SCRIPT = """
   return stamped;
 }
 """
+
+
+class AmbiguousAlignmentError(RuntimeError):
+    """The DOM could not be aligned to exactly one source element per oid.
+
+    Raised rather than returning the ambiguous map. ``visual_edit`` patches by
+    oid, so handing back a map where one oid names several elements would let
+    an edit land on an element the caller did not pick.
+    """
 
 
 @dataclass
@@ -214,7 +224,39 @@ def _dom_paths_to_oids(
         ))
 
     elements.sort(key=lambda e: e.path)
+
+    # Containment for a known alignment defect, see AmbiguousAlignmentError.
+    # `known` is keyed on the structural path alone, so two components with an
+    # element at the same relative path collapse to one entry, and the single
+    # global anchor above only holds for a page rendered from one component.
+    # Any real layout (header + page + footer) breaks both assumptions. Until
+    # the alignment is per-component, refuse the ambiguous map rather than
+    # letting visual_edit act on it.
+    counts = Counter(e.oid for e in elements)
+    duplicated = sorted(oid for oid, n in counts.items() if n > 1)
+    if duplicated:
+        offenders = ", ".join(
+            f"{oid} -> {[e.tag for e in elements if e.oid == oid]}"
+            for oid in duplicated[:3]
+        )
+        raise AmbiguousAlignmentError(
+            f"{len(duplicated)} oid(s) matched more than one DOM element "
+            f"({offenders}). The page renders more than one indexed component, "
+            "which this alignment cannot resolve. Editing by oid here would "
+            "patch the wrong element."
+        )
+
     return elements, unmapped
+
+
+def _overall_status(routes_out: list[dict[str, Any]]) -> str:
+    """"pass" only when every route stamped. A route error is never a pass.
+
+    Per-route failures are caught into that route's own ``error`` key so one
+    bad route does not abort the rest. The overall status has to reflect them,
+    or a caller reading it sees green on a run that mapped nothing.
+    """
+    return "error" if any(r.get("error") for r in routes_out) else "pass"
 
 
 async def _map_route(
@@ -279,7 +321,7 @@ async def _run_element_map(
         finally:
             await browser.close()
 
-    return {"status": "pass", "routes": routes_out}
+    return {"status": _overall_status(routes_out), "routes": routes_out}
 
 
 def element_map(
