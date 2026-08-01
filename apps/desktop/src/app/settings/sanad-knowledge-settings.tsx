@@ -74,7 +74,11 @@ export function SanadKnowledgeSettings() {
       setHealth(
         `${h.chunk_count ?? 0} chunks · ${h.embedding?.provider ?? '?'} · ${h.embedding?.model ?? '?'}`
       )
-      const c = (await sanadFetch('/v1/corpus')) as { documents?: CorpusDoc[] }
+      // Corpus is ACL filtered and requires a principal. This panel manages
+      // uploads, which land public, so a bare principal sees everything it
+      // can act on. Real per-user identity replaces this in S-P4.
+      const query = new URLSearchParams({ user_id: 'settings-admin' })
+      const c = (await sanadFetch(`/v1/corpus?${query}`)) as { documents?: CorpusDoc[] }
       setCorpus(c.documents || [])
     } catch (e) {
       setHealth('Sanad API offline')
