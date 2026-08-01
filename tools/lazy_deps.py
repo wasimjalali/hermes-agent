@@ -125,7 +125,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # binaries: `python -m playwright install chromium`.
     "burooj.browser": (
         "playwright==1.58.0",
-        "pillow==12.1.0",
     ),
 
     # ─── Web search backends ───────────────────────────────────────────────

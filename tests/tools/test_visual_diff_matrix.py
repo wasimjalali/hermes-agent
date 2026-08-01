@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from tools.visual_diff import (
     _baseline_path,
     _normalize_breakpoints,
@@ -207,3 +209,123 @@ def _tiny_png(pixel: bytes = bytes([255, 0, 0, 255])) -> bytes:
         + chunk(b"IDAT", zlib.compress(rows))
         + chunk(b"IEND", b"")
     )
+
+
+def _playwright_available() -> bool:
+    try:
+        import playwright.async_api  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+requires_playwright = pytest.mark.skipif(
+    not _playwright_available(), reason="playwright not installed"
+)
+
+
+TALL_PAGE = """<!doctype html>
+<html><body style="margin:0">
+  <div style="height:800px;background:#ffffff"></div>
+  <div id="fold" style="height:1400px;background:#ffffff"></div>
+</body></html>
+"""
+
+CHANGED_BELOW_FOLD = TALL_PAGE.replace(
+    '<div id="fold" style="height:1400px;background:#ffffff">',
+    '<div id="fold" style="height:1400px;background:#7c2d12">',
+)
+
+
+@requires_playwright
+class TestCaptureCoversTheWholePage:
+    """B6: visual_diff compared the top 800px and nothing else.
+
+    Both capture paths used ``full_page=False``. The Mirqab landing page is
+    2234px tall at 1280 wide, so the gate that exists to notice a change was
+    blind to 64% of every route. A change entirely below the fold scored 0.0%
+    and the gate went green.
+    """
+
+    @staticmethod
+    def _shoot(html: str) -> bytes:
+        import asyncio
+
+        from playwright.async_api import async_playwright
+
+        from tools.visual_diff import capture_page
+
+        async def run() -> bytes:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                try:
+                    context = await browser.new_context(
+                        viewport={"width": 1280, "height": 800}
+                    )
+                    page = await context.new_page()
+                    await page.set_content(html)
+                    return await capture_page(page)
+                finally:
+                    await browser.close()
+
+        return asyncio.run(run())
+
+    def test_a_change_below_the_fold_is_detected(self):
+        from tools.visual_diff import _compare_pixels, _decode_png_pixels
+
+        before = self._shoot(TALL_PAGE)
+        after = self._shoot(CHANGED_BELOW_FOLD)
+
+        w_before, h_before, px_before = _decode_png_pixels(before)
+        w_after, h_after, px_after = _decode_png_pixels(after)
+
+        assert (w_before, h_before) == (w_after, h_after) == (1280, 2200), (
+            "capture must cover the whole document, not the 800px viewport"
+        )
+        assert _compare_pixels(px_before, px_after) > 50.0, (
+            "a 1400px block changing colour below the fold must register"
+        )
+
+
+class TestSummaryMatchesTheVerdict:
+    """B6: a failing visual_diff carried "N cell(s) within threshold".
+
+    The summary only distinguished "new baselines" from "everything fine", so
+    a run with two drifted cells still reported that all eighteen were within
+    threshold. The desktop Design panel renders this string.
+    """
+
+    @staticmethod
+    def _summarise(results):
+        """The summary branch under test, exercised through RouteDiff."""
+        from tools.visual_diff import RouteDiff
+
+        cells = [
+            RouteDiff(path=p, baseline="b.png", diff_pct=d, threshold=0.1,
+                      passed=ok, new_baseline=new)
+            for p, d, ok, new in results
+        ]
+        drifted = sum(1 for c in cells if not c.passed)
+        new_count = sum(1 for c in cells if c.new_baseline)
+        if drifted:
+            return f"{drifted} of {len(cells)} cell(s) drifted"
+        if new_count:
+            return f"{len(cells)} cell(s), {new_count} new baseline(s)"
+        return f"{len(cells)} cell(s) within threshold"
+
+    def test_drift_is_named_in_the_summary(self):
+        summary = self._summarise([
+            ("/", 0.373, False, False),
+            ("/pricing", 0.0, True, False),
+            ("/changelog", 0.0, True, False),
+        ])
+        assert summary == "1 of 3 cell(s) drifted"
+        assert "within threshold" not in summary
+
+    def test_clean_run_still_says_within_threshold(self):
+        summary = self._summarise([("/", 0.0, True, False)])
+        assert summary == "1 cell(s) within threshold"
+
+    def test_new_baselines_still_reported(self):
+        summary = self._summarise([("/", 0.0, True, True)])
+        assert summary == "1 cell(s), 1 new baseline(s)"

@@ -10,6 +10,13 @@ def _load_optional_dependencies():
     return project["optional-dependencies"]
 
 
+def _load_base_dependencies():
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        project = tomllib.load(handle)["project"]
+    return project["dependencies"]
+
+
 def _load_package_data():
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject_path.open("rb") as handle:
@@ -182,6 +189,33 @@ def test_pyproject_pins_match_lazy_deps_pins():
         "for every shared package — otherwise `hermes update` downgrades the "
         "package below the security-current lazy pin (see #31817). Drift: "
         f"{drift}"
+    )
+
+
+def test_no_extra_pin_conflicts_with_a_base_dependency_pin():
+    """An extra that re-pins a base dependency makes the install unsatisfiable.
+
+    pip resolves the base `dependencies` list and the requested extras
+    together. When both exact-pin the same package to different versions
+    there is no solution, so `pip install -e ".[<extra>]"` fails outright
+    rather than degrading. Found by B6: `burooj-browser` pinned
+    `pillow==12.1.0` while the base list pinned `Pillow==12.2.0`, so the
+    documented Build setup command had never installed on any machine.
+    """
+    base_pins = _exact_pins(_load_base_dependencies())
+    optional_dependencies = _load_optional_dependencies()
+
+    conflicts = {
+        f"{extra}:{package}": (version, base_pins[package])
+        for extra, specs in optional_dependencies.items()
+        for package, version in _exact_pins(specs).items()
+        if package in base_pins and version != base_pins[package]
+    }
+
+    assert not conflicts, (
+        "an extra must not exact-pin a package the base dependencies already "
+        "exact-pin to a different version; pip cannot satisfy both. "
+        f"extra:package -> (extra pin, base pin): {conflicts}"
     )
 
 

@@ -422,3 +422,146 @@ class TestPngDecode:
 
         with pytest.raises(PngDecodeError):
             _decode_png_pixels(b"definitely not a png")
+
+
+class TestDevServerShutdown:
+    """B6: verify() leaked a next-server past interpreter exit.
+
+    ``stop_all_sessions`` existed but had no caller anywhere in the tree. Its
+    only other mention was a comment in ``verify_tool.verify`` claiming it was
+    "the shutdown path". So the first ladder run that reached the render rung
+    left a dev server holding the port, and every later run in a fresh process
+    failed the render rung with "Port N is already in use by a process this
+    session did not start".
+    """
+
+    def test_stop_all_sessions_is_registered_with_atexit(self):
+        import subprocess
+        import sys
+
+        # A fresh interpreter, with atexit.register wrapped so the import's
+        # own registrations are recorded by name.
+        probe = (
+            "import atexit\n"
+            "seen = []\n"
+            "real = atexit.register\n"
+            "def spy(fn, *a, **k):\n"
+            "    seen.append(getattr(fn, '__qualname__', repr(fn)))\n"
+            "    return real(fn, *a, **k)\n"
+            "atexit.register = spy\n"
+            "import agent.build_session  # noqa: F401\n"
+            "atexit.register = real\n"
+            "print('stop_all_sessions' in seen)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().splitlines()[-1] == "True", (
+            "agent.build_session must register stop_all_sessions with atexit, "
+            "otherwise every dev server it starts outlives the process and "
+            f"holds its port. stderr: {result.stderr}"
+        )
+
+
+class TestServerProblemClassifier:
+    """B6: the render rung failed a healthy Next.js app on a warning line.
+
+    ``_server_problems`` recognised a warning only when the line began with
+    the literal words "warn", "info" or "debug". Next.js prefixes its log
+    levels with glyphs instead, so the routine Turbopack cache warning below
+    (which contains the word "error") was classified as a server crash and
+    turned the render rung red on an app that served every route correctly.
+    """
+
+    TURBOPACK_WARNING = (
+        "⚠ Turbopack's filesystem cache has been deleted because we "
+        "previously detected an internal error in Turbopack. Builds or page "
+        "loads may be slower as a result."
+    )
+
+    def test_glyph_prefixed_warning_is_not_a_server_problem(self):
+        from tools.verify_tool import _server_problems
+
+        assert _server_problems([self.TURBOPACK_WARNING]) == []
+
+    def test_word_prefixed_warning_is_still_not_a_problem(self):
+        from tools.verify_tool import _server_problems
+
+        assert _server_problems(["warn  - an error occurred while probing"]) == []
+
+    def test_glyph_prefixed_error_is_still_a_problem(self):
+        """The fix must not swallow Next.js' error glyph along with the warning one."""
+        from tools.verify_tool import _server_problems
+
+        line = "⨯ Internal error: route handler threw"
+        assert _server_problems([line]) == [line]
+
+    def test_unprefixed_error_is_still_a_problem(self):
+        from tools.verify_tool import _server_problems
+
+        line = "Error: connect ECONNREFUSED 127.0.0.1:5432"
+        assert _server_problems([line]) == [line]
+
+
+class TestVisualDiffFailureSummary:
+    """B6: six drifted cells printed as three identical lines saying "/".
+
+    ``visual_diff`` captures a route x breakpoint x theme matrix so a
+    responsive or theme regression is caught where it happens. The design
+    gate's summary dropped the breakpoint and the theme, called cells
+    "route(s)", and truncated at three with no note that it had.
+    """
+
+    @staticmethod
+    def _cells():
+        return {
+            "routes": [
+                {"path": "/", "breakpoint": 390, "theme": "light",
+                 "diff_pct": 7.505, "threshold": 0.1, "passed": False},
+                {"path": "/", "breakpoint": 390, "theme": "dark",
+                 "diff_pct": 7.505, "threshold": 0.1, "passed": False},
+                {"path": "/", "breakpoint": 1280, "theme": "light",
+                 "diff_pct": 3.931, "threshold": 0.1, "passed": False},
+                {"path": "/", "breakpoint": 1280, "theme": "dark",
+                 "diff_pct": 3.931, "threshold": 0.1, "passed": False},
+                {"path": "/pricing", "breakpoint": 390, "theme": "light",
+                 "diff_pct": 1.2, "threshold": 0.1, "passed": False},
+                {"path": "/pricing", "breakpoint": 1280, "theme": "light",
+                 "diff_pct": 1.4, "threshold": 0.1, "passed": False},
+                {"path": "/changelog", "breakpoint": 390, "theme": "light",
+                 "diff_pct": 0.0, "threshold": 0.1, "passed": True},
+            ]
+        }
+
+    def test_every_reported_cell_line_is_distinguishable(self):
+        from tools.verify_tool import format_visual_diff_failure
+
+        lines = format_visual_diff_failure(self._cells())
+        cell_lines = [ln for ln in lines if ln.startswith("  ") and "more" not in ln]
+        assert len(cell_lines) == len(set(cell_lines)), (
+            f"cells must be individually identifiable, got: {cell_lines}"
+        )
+
+    def test_breakpoint_and_theme_appear_in_the_label(self):
+        from tools.verify_tool import format_visual_diff_failure
+
+        lines = format_visual_diff_failure(self._cells())
+        assert any("@390px" in ln and "[dark]" in ln for ln in lines)
+
+    def test_header_counts_cells_and_routes_separately(self):
+        from tools.verify_tool import format_visual_diff_failure
+
+        header = format_visual_diff_failure(self._cells())[0]
+        assert "6 cell(s) drifted" in header
+        assert "2 route(s)" in header
+
+    def test_truncation_is_disclosed(self):
+        from tools.verify_tool import format_visual_diff_failure
+
+        lines = format_visual_diff_failure(self._cells(), limit=2)
+        assert lines[-1] == "  ... and 4 more"

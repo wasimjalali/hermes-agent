@@ -220,6 +220,14 @@ _BENIGN_SERVER_PATTERNS = (
     "without errors", "errors: 0",
 )
 
+# Prefixes that mark a line's severity as below "error". Next.js and Turbopack
+# prefix their log levels with glyphs rather than words ("⚠" warning, "ℹ" note,
+# "✓" success, "⨯" error), so a word-only test read every glyph-prefixed
+# warning as a failure. The routine "Turbopack's filesystem cache has been
+# deleted ... internal error in Turbopack" warning failed the render rung on an
+# app that served every route.
+_NON_ERROR_LINE_PREFIXES = ("warn", "info", "debug", "⚠", "ℹ", "✓")
+
 # Lines that genuinely indicate the server is broken.
 _FATAL_SERVER_PATTERNS = (
     "eaddrinuse", "cannot find module", "module not found",
@@ -228,13 +236,45 @@ _FATAL_SERVER_PATTERNS = (
 )
 
 
+def format_visual_diff_failure(result: dict[str, Any], limit: int = 5) -> list[str]:
+    """Format a failing ``visual_diff`` result for the design gate summary.
+
+    Every entry is one route x breakpoint x theme cell, and the label has to
+    say which. Reporting the route alone made six drifted cells of ``/`` print
+    as six identical lines, which is the exact information the capture matrix
+    exists to provide.
+    """
+    failing = [r for r in result.get("routes", []) if not r.get("passed")]
+    routes = {r.get("path") for r in failing}
+    out = [
+        f"visual_diff: FAIL ({len(failing)} cell(s) drifted "
+        f"across {len(routes)} route(s))"
+    ]
+    for cell in failing[:limit]:
+        label = cell.get("path", "?")
+        if cell.get("breakpoint"):
+            label += f" @{cell['breakpoint']}px"
+        if cell.get("theme"):
+            label += f" [{cell['theme']}]"
+        out.append(
+            f"  {label}: {cell.get('diff_pct')}% changed "
+            f"(threshold {cell.get('threshold')}%)"
+        )
+    if len(failing) > limit:
+        out.append(f"  ... and {len(failing) - limit} more")
+    return out
+
+
 def _server_problems(lines: list[str]) -> list[str]:
     """Return dev-server log lines that indicate a real failure.
 
     The first cut flagged any line containing "error", which meant a build
     reporting "compiled with 0 errors" failed the rung. Match known-fatal
     patterns instead, and treat a bare "error" as a problem only when the line
-    is not on the benign list.
+    is not on the benign list and is not marked as a lower severity.
+
+    A fatal pattern beats the severity marker on purpose: a warning-prefixed
+    line saying EADDRINUSE is still a dead server.
     """
     problems: list[str] = []
     for line in lines:
@@ -244,7 +284,7 @@ def _server_problems(lines: list[str]) -> list[str]:
         if any(p in low for p in _FATAL_SERVER_PATTERNS):
             problems.append(line)
             continue
-        if "error" in low and not low.lstrip().startswith(("warn", "info", "debug")):
+        if "error" in low and not low.lstrip().startswith(_NON_ERROR_LINE_PREFIXES):
             problems.append(line)
     return problems
 
@@ -395,16 +435,7 @@ def _run_rung_design_gate(manifest: BuildManifest, session: BuildSession) -> Run
 
     vdiff_result = visual_diff(workspace=workspace)
 
-    def vdiff_detail() -> list[str]:
-        failing = [r for r in vdiff_result.get("routes", []) if not r["passed"]]
-        out = [f"visual_diff: FAIL ({len(failing)} route(s) drifted)"]
-        out += [
-            f"  {r['path']}: {r['diff_pct']}% changed (threshold {r['threshold']}%)"
-            for r in failing[:3]
-        ]
-        return out
-
-    record("visual_diff", vdiff_result, vdiff_detail)
+    record("visual_diff", vdiff_result, lambda: format_visual_diff_failure(vdiff_result))
 
     # Rung 5 of the design gate: VLM critique. Deliberately advisory and
     # opt-in. Vision models cost money, leave the machine, and are not
@@ -664,10 +695,12 @@ def verify(
                 if rungs is None:
                     break
     finally:
-        # The dev server outlives a single verify only while the session is
-        # alive; nothing here leaks a process past interpreter exit because
-        # start_process runs in its own process group and stop_all_sessions
-        # is the shutdown path.
+        # The dev server deliberately outlives a single verify: the session
+        # owns it so the next rung and the next call reuse one warm server.
+        # Teardown is agent.build_session's atexit hook, which is where it has
+        # to live, since nothing here knows whether another rung still wants
+        # the server. Leaving the process alive past interpreter exit would
+        # hold the port and make every later render rung refuse to run.
         pass
 
     response["results"] = results

@@ -532,3 +532,126 @@ class TestRegistration:
         tools = set(resolve_toolset("burooj_design"))
         assert "element_map" in tools
         assert "visual_edit" in tools
+
+
+HEADER_TSX = '''export function SiteHeader() {
+  return (
+    <header className="border-b">
+      <a href="/pricing">Pricing</a>
+    </header>
+  )
+}
+'''
+
+PRICING_TSX = '''export default function PricingPage() {
+  return (
+    <main className="py-3xl">
+      <h1 className="text-heading-xl">Three plans</h1>
+    </main>
+  )
+}
+'''
+
+
+@requires_tree_sitter
+class TestDomAlignmentAcrossComponents:
+    """B6: element_map handed eight different elements the same oid.
+
+    ``_dom_paths_to_oids`` keys its lookup on the structural path alone
+    (``known = {tuple(e.path): oid ...}``), so every component in the
+    workspace with an element at the same relative path collapses into one
+    entry and the last one indexed wins. It then aligns the whole page to a
+    single anchor, which only holds for a page rendered from one component.
+
+    On the real Mirqab /pricing route (header + page + footer) this produced
+    26 elements carrying 16 oids, with one oid shared by 8 elements across
+    three files. ``visual_edit`` targets by oid, so acting on that map edits
+    an element the caller did not pick.
+    """
+
+    @staticmethod
+    def _two_component_workspace(tmp_path):
+        (tmp_path / "src").mkdir(parents=True)
+        (tmp_path / "src" / "site-header.tsx").write_text(HEADER_TSX, encoding="utf-8")
+        (tmp_path / "src" / "pricing.tsx").write_text(PRICING_TSX, encoding="utf-8")
+        return tmp_path
+
+    # header and page rendered into one document, as any real layout does
+    DOM = [
+        {"path": "0", "tag": "body", "text": "", "classes": []},
+        {"path": "0.0", "tag": "header", "text": "", "classes": ["border-b"]},
+        {"path": "0.0.0", "tag": "a", "text": "Pricing", "classes": []},
+        {"path": "0.1", "tag": "main", "text": "", "classes": ["py-3xl"]},
+        {"path": "0.1.0", "tag": "h1", "text": "Three plans", "classes": ["text-heading-xl"]},
+    ]
+
+    def test_caller_never_receives_a_map_with_duplicate_oids(self, tmp_path):
+        """Refusing is acceptable. Returning an ambiguous map is not.
+
+        Passes either under the current containment (raise) or under a real
+        per-component alignment (unique map). Fails on the pre-B6 code, which
+        returned four elements carrying two oids.
+        """
+        from tools.element_map import AmbiguousAlignmentError, _dom_paths_to_oids
+
+        index = build_source_index(self._two_component_workspace(tmp_path), use_cache=False)
+        try:
+            elements, _unmapped = _dom_paths_to_oids(self.DOM, index)
+        except AmbiguousAlignmentError:
+            return
+
+        oids = [e.oid for e in elements]
+        assert len(oids) == len(set(oids)), (
+            "an oid identifies exactly one JSX element; visual_edit patches by "
+            "oid, so a duplicate means an edit lands on the wrong element. "
+            + repr([(e.tag, e.path, e.oid) for e in elements])
+        )
+
+    def test_single_component_page_still_aligns(self, tmp_path):
+        """The containment must not break the case that already worked."""
+        from tools.element_map import _dom_paths_to_oids
+
+        make_workspace(tmp_path)
+        index = build_source_index(tmp_path, use_cache=False)
+        dom = [
+            {"path": "0", "tag": "div", "text": "", "classes": []},
+            {"path": "0.0", "tag": "main", "text": "", "classes": ["bg-white"]},
+            {"path": "0.0.0", "tag": "h1", "text": "Hello", "classes": []},
+        ]
+        elements, _unmapped = _dom_paths_to_oids(dom, index)
+        assert {e.tag for e in elements} == {"main", "h1"}
+        assert len({e.oid for e in elements}) == 2
+
+
+class TestElementMapOverallStatus:
+    """B6: element_map returned status "pass" when every route failed to stamp.
+
+    ``_run_element_map`` caught each route's exception into that route's own
+    ``error`` key and then returned a hard-coded ``{"status": "pass"}``. A
+    caller reading the status saw green on a run that mapped nothing. Found
+    when the alignment guard started raising and the tool still said pass.
+    """
+
+    def test_all_routes_failing_is_not_a_pass(self):
+        from tools.element_map import _overall_status
+
+        routes = [
+            {"path": "/", "elements": [], "error": "stamp failed: RuntimeError: x"},
+            {"path": "/pricing", "elements": [], "error": "stamp failed: RuntimeError: x"},
+        ]
+        assert _overall_status(routes) == "error"
+
+    def test_one_route_failing_is_not_a_pass(self):
+        from tools.element_map import _overall_status
+
+        routes = [
+            {"path": "/", "elements": [{"oid": "a"}]},
+            {"path": "/pricing", "elements": [], "error": "stamp failed: RuntimeError: x"},
+        ]
+        assert _overall_status(routes) == "error"
+
+    def test_all_routes_clean_is_a_pass(self):
+        from tools.element_map import _overall_status
+
+        routes = [{"path": "/", "elements": [{"oid": "a"}]}]
+        assert _overall_status(routes) == "pass"
