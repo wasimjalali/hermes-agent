@@ -83,10 +83,11 @@ def fake_docker(tmp_path: Path) -> str:
             if [ -n "$DETACH" ]; then
               # Detached: fully detach like a real daemon. The child must not
               # hold the CLI's stdout/stderr pipes or it dies when the caller
-              # closes them; its log goes to a file `docker logs` can replay.
-              # nohup + </dev/null keeps it alive after the parent shell exits
-              # (portable: macOS has no setsid).
-              nohup sh -lc "$FULL" > "$STATE_DIR/$NAME.log" 2>&1 < /dev/null &
+              # closes them. Split streams so `docker logs` can demultiplex
+              # the way the real CLI does (stdout -> CLI stdout, stderr ->
+              # CLI stderr). nohup + </dev/null keeps it alive after the
+              # parent shell exits (portable: macOS has no setsid).
+              nohup sh -lc "$FULL" > "$STATE_DIR/$NAME.stdout" 2> "$STATE_DIR/$NAME.stderr" < /dev/null &
               echo "$!" > "$STATE_DIR/$NAME.pid"
               echo "$NAME"
               exit 0
@@ -127,7 +128,7 @@ def fake_docker(tmp_path: Path) -> str:
             exit 0
             ;;
           logs)
-            # docker logs -f --tail 0 NAME — follow the captured log.
+            # docker logs -f --tail 0 NAME: demultiplex like the real CLI.
             NAME=""
             FOLLOW=""
             while [ "$#" -gt 0 ]; do
@@ -137,27 +138,34 @@ def fake_docker(tmp_path: Path) -> str:
                 *) NAME="$1"; shift ;;
               esac
             done
-            LOG="$STATE_DIR/$NAME.log"
-            # Wait briefly for the log file to appear.
+            OUTLOG="$STATE_DIR/$NAME.stdout"
+            ERRLOG="$STATE_DIR/$NAME.stderr"
+            # Wait briefly for either stream file to appear.
             i=0
-            while [ ! -f "$LOG" ] && [ "$i" -lt 50 ]; do
+            while [ ! -f "$OUTLOG" ] && [ ! -f "$ERRLOG" ] && [ "$i" -lt 50 ]; do
               sleep 0.05
               i=$((i + 1))
             done
-            if [ -n "$FOLLOW" ] && [ -f "$LOG" ]; then
-              # Follow until the container exits.
-              tail -n +1 -f "$LOG" &
-              TAILPID=$!
+            # Touch empty files so tail -f has something to open.
+            : >> "$OUTLOG"
+            : >> "$ERRLOG"
+            if [ -n "$FOLLOW" ]; then
+              tail -n +1 -f "$OUTLOG" &
+              TAIL_OUT=$!
+              tail -n +1 -f "$ERRLOG" >&2 &
+              TAIL_ERR=$!
               if [ -f "$STATE_DIR/$NAME.pid" ]; then
                 PID="$(cat "$STATE_DIR/$NAME.pid")"
                 while kill -0 "$PID" 2>/dev/null; do sleep 0.05; done
               else
                 sleep 1
               fi
-              kill "$TAILPID" 2>/dev/null
-              wait "$TAILPID" 2>/dev/null
-            elif [ -f "$LOG" ]; then
-              cat "$LOG"
+              kill "$TAIL_OUT" "$TAIL_ERR" 2>/dev/null
+              wait "$TAIL_OUT" 2>/dev/null
+              wait "$TAIL_ERR" 2>/dev/null
+            else
+              cat "$OUTLOG" 2>/dev/null
+              cat "$ERRLOG" >&2 2>/dev/null
             fi
             exit 0
             ;;
@@ -385,7 +393,7 @@ class TestLadderWithContainerRuntime:
 
 class TestDockerLogCapture:
     def test_logs_land_once_without_duplication(self, fake_docker, tmp_path):
-        """H4: one log follower; stdout is not mirrored into stderr."""
+        """H4: one log follower; streams demultiplex; no cross-stream copy."""
         import time
 
         rt = make_runtime(fake_docker)
@@ -398,13 +406,20 @@ class TestDockerLogCapture:
             deadline = time.time() + 3
             while time.time() < deadline:
                 outs = list(handle.stdout_lines)
-                if any("OUT_MARKER" in line for line in outs):
+                errs = list(handle.stderr_lines)
+                if any("OUT_MARKER" in line for line in outs) and any(
+                    "ERR_MARKER" in line for line in errs
+                ):
                     break
                 time.sleep(0.05)
             time.sleep(0.3)
             outs = list(handle.stdout_lines)
             errs = list(handle.stderr_lines)
             assert any("OUT_MARKER" in line for line in outs), outs
+            # Real docker logs demultiplexes: container stderr -> CLI stderr.
+            assert any("ERR_MARKER" in line for line in errs), errs
+            assert not any("ERR_MARKER" in line for line in outs), outs
+            assert not any("OUT_MARKER" in line for line in errs), errs
             # No line should appear in both lists (the old bug duplicated
             # every line into stderr_lines from a second docker logs -f).
             both = set(outs) & set(errs)

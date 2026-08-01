@@ -2417,3 +2417,59 @@ def test_default_config_has_no_duplicate_top_level_keys():
             if "model" in keys and "kanban" in keys:  # the DEFAULT_CONFIG literal
                 dupes = {k for k in keys if keys.count(k) > 1}
                 assert not dupes, f"duplicate DEFAULT_CONFIG keys: {sorted(dupes)}"
+
+
+class TestBuroojSchemaV34:
+    """v33 → 34 adds burooj defaults in DEFAULT_CONFIG only.
+
+    Schema defaults must not be materialised to disk (see _persist_migration).
+    Discoverability is via the commented template block in save_config output.
+    """
+
+    def test_v33_to_34_does_not_seed_burooj_on_disk(self, tmp_path, capsys):
+        latest = DEFAULT_CONFIG["_config_version"]
+        assert latest >= 34
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 33,
+                    "model": {"default": "test-model", "provider": "openrouter"},
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=False)
+            raw_text = config_path.read_text(encoding="utf-8")
+            raw = yaml.safe_load(raw_text)
+            loaded = load_config()
+
+        assert raw["_config_version"] == latest
+        assert "burooj" not in raw, (
+            "migration 34 must not materialise schema-default burooj keys; "
+            f"on-disk burooj={raw.get('burooj')!r}"
+        )
+        # Defaults still apply at read time.
+        assert loaded["burooj"]["model_hints"]["coding"] == ""
+        assert loaded["burooj"]["vlm_critique"] is False
+        # Must not claim keys were written when they were not.
+        claimed = [c for c in results["config_added"] if "burooj.model_hints" in str(c)
+                   or str(c).startswith("burooj.vlm_critique")]
+        assert not claimed, f"migration claimed to add defaults it did not write: {claimed}"
+        out = capsys.readouterr().out
+        assert "Added burooj.model_hints" not in out
+
+    def test_save_config_documents_burooj_in_comment_template(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"_config_version": 34, "model": {"default": "m"}}, sort_keys=False),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config({"_config_version": 34, "model": {"default": "m", "provider": "openrouter"}})
+            text = config_path.read_text(encoding="utf-8")
+        assert "burooj:" in text
+        assert "model_hints:" in text
+        assert "vlm_critique:" in text

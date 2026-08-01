@@ -644,10 +644,10 @@ class DockerRuntime(Runtime):
 
         # One docker logs -f process. Drain stdout and stderr of that CLI
         # process on separate threads so a chatty stream cannot fill a pipe
-        # buffer and block. docker logs merges container streams onto its
-        # own stdout by default; stderr is the CLI's diagnostic stream.
-        # Starting two docker logs processes was the old bug: every line
-        # landed twice and one stderr pipe was never read.
+        # buffer and block. For a non-TTY container, docker logs demultiplexes:
+        # container stdout -> CLI stdout, container stderr -> CLI stderr. That
+        # is why both pipes must be drained. Starting two docker logs processes
+        # was the old bug: every line landed twice and one pipe was never read.
         try:
             log_proc = subprocess.Popen(
                 [self.docker_cmd, "logs", "-f", "--tail", "0", name],

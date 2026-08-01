@@ -297,6 +297,21 @@ class TestVisualEdit:
         with pytest.raises(EditError, match=r"[{}<]"):
             _apply_patch(index, h1.oid, "set_text", "", "<script>x</script>")
 
+    def test_set_text_allows_greater_than(self, tmp_path):
+        """L1: '>' is allowed; only '<', '{', '}' are refused.
+
+        Bare '>' does not parse as TSX text, so the patch uses a JSX string
+        expression. The rendered text still contains the greater-than sign.
+        """
+        make_workspace(tmp_path)
+        index = build_source_index(tmp_path)
+        h1 = next(e for e in index.by_oid.values() if e.tag == "h1")
+        path, old, new, patched = _apply_patch(
+            index, h1.oid, "set_text", "", "5 > 3 is true"
+        )
+        assert b'{"5 > 3 is true"}' in patched
+        assert b">{" in patched or b">{\"" in patched or b'{"5 > 3 is true"}' in patched
+
 
 @requires_tree_sitter
 class TestDomAlignment:

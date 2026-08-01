@@ -3378,6 +3378,20 @@ _FALLBACK_COMMENT = """
 #   model: anthropic/claude-sonnet-4
 """
 
+_BUROOJ_COMMENT = """
+# ── Burooj mode routing ───────────────────────────────────────────────
+# Build ("coding") and Design ("vision") model overrides. Empty or omitted
+# hints fall back to the default model. vlm_critique is opt-in advisory
+# only; it never blocks the design gate. Defaults live in DEFAULT_CONFIG
+# and are not written to disk until you set a real value.
+#
+# burooj:
+#   model_hints:
+#     coding: ""    # e.g. anthropic/claude-sonnet-4-5
+#     vision: ""    # e.g. openrouter/google/gemini-2.5-flash
+#   vlm_critique: false
+"""
+
 
 _COMMENTED_SECTIONS = """
 # ── Security ──────────────────────────────────────────────────────────
@@ -3408,6 +3422,16 @@ _COMMENTED_SECTIONS = """
 # fallback_model:
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
+
+# ── Burooj mode routing ───────────────────────────────────────────────
+# Build ("coding") and Design ("vision") model overrides. Empty hints fall
+# back to the default model. vlm_critique is opt-in advisory only.
+#
+# burooj:
+#   model_hints:
+#     coding: ""
+#     vision: ""
+#   vlm_critique: false
 """
 
 
@@ -3516,6 +3540,9 @@ def save_config(
             fb_is_valid = bool(fb.get("provider") and fb.get("model"))
         if not fb_is_valid:
             parts.append(_FALLBACK_COMMENT)
+        burooj = normalized.get("burooj")
+        if not burooj:
+            parts.append(_BUROOJ_COMMENT)
 
         atomic_yaml_write(
             config_path,

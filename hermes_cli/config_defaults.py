@@ -2996,8 +2996,9 @@ DEFAULT_CONFIG = {
     # Burooj mode model routing. Maps a ContextProfile.model_hint to a model
     # id. "coding" serves Build mode, "vision" serves Design mode. An empty
     # value (or an unmapped hint) falls back to the default model selection.
-    # Existing installs get this key via the config migration to version 34;
-    # fill in real model ids for your provider. Example:
+    # Schema version 34 introduced this section; defaults are merged at read
+    # time and documented in the commented burooj template save_config writes.
+    # Fill real model ids for your provider. Example:
     #   burooj:
     #     model_hints:
     #       coding: "anthropic/claude-sonnet-4-5"

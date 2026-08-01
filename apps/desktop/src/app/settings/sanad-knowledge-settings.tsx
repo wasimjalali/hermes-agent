@@ -205,7 +205,7 @@ export function SanadKnowledgeSettings() {
               </Button>
             </label>
           }
-          description="Markdown, text, JSON and HTML files. Ingested with public access scope."
+          description="Markdown, text, JSON and HTML. Public scope. Writes need SANAD_ADMIN_TOKEN on the API (or SANAD_ALLOW_UNAUTHENTICATED_WRITES=1 for open local). Upload stays disabled until one is set; gateway token wiring is not wired yet."
           title="Upload a document"
         />
         {uploadNote ? (

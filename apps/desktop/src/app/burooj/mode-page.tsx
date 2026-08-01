@@ -112,12 +112,20 @@ export function mergeDesignChecks(
     a11y_check: null
   }
 
+  // When prev is null the base holds a 'missing' placeholder; take checks.tokens
+  // rather than keeping that placeholder. With a real prev, keep its tokens when
+  // checks omits them.
+  const nextTokens =
+    prev === null
+      ? ((checks as DesignStatus).tokens ?? base.tokens)
+      : base.tokens?.tokens || base.tokens?.status
+        ? base.tokens
+        : ((checks as DesignStatus).tokens ?? base.tokens)
+
   return {
     ...base,
     workspace: base.workspace || (checks as DesignStatus).workspace || '',
-    tokens: base.tokens?.tokens || base.tokens?.status
-      ? base.tokens
-      : (checks as DesignStatus).tokens ?? base.tokens,
+    tokens: nextTokens,
     contrast: checks.contrast ?? base.contrast,
     lint: checks.lint ?? base.lint,
     visual_diff: checks.visual_diff !== undefined ? checks.visual_diff : base.visual_diff,

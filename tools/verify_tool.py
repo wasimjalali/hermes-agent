@@ -426,6 +426,11 @@ def _run_rung_design_gate(manifest: BuildManifest, session: BuildSession) -> Run
     )
 
 
+_vlm_critique_cfg_loaded = False
+_vlm_critique_cfg_value = False
+_vlm_critique_cfg_logged = False
+
+
 def _vlm_critique_enabled() -> bool:
     """Whether the advisory VLM critique runs inside the design gate.
 
@@ -434,18 +439,30 @@ def _vlm_critique_enabled() -> bool:
     """
     import os
 
+    global _vlm_critique_cfg_loaded, _vlm_critique_cfg_value, _vlm_critique_cfg_logged
+
     env = os.environ.get("BUROOJ_VLM_CRITIQUE", "").strip().lower()
     if env in {"1", "true", "yes", "on"}:
         return True
     if env in {"0", "false", "no", "off"}:
         return False
+    if _vlm_critique_cfg_loaded:
+        return _vlm_critique_cfg_value
     try:
         from hermes_cli.config import load_config
 
         cfg = load_config() or {}
-        flag = (cfg.get("burooj") or {}).get("vlm_critique")
-        return bool(flag)
+        flag = bool((cfg.get("burooj") or {}).get("vlm_critique"))
+        _vlm_critique_cfg_value = flag
+        _vlm_critique_cfg_loaded = True
+        return flag
     except Exception:
+        if not _vlm_critique_cfg_logged:
+            logger.warning(
+                "could not read burooj.vlm_critique from config; VLM critique stays off",
+                exc_info=True,
+            )
+            _vlm_critique_cfg_logged = True
         return False
 
 

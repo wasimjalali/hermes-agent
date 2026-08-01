@@ -76,7 +76,9 @@ def _attr_value_literal(value: str) -> str:
     return assignment[len("_="):]
 
 
-_TEXT_FORBIDDEN = frozenset("{}<>")
+# Refuse characters that introduce JSX structure. ">" is allowed; bare ">"
+# confuses the TSX parser, so _set_text_patch emits a JSX string expression.
+_TEXT_FORBIDDEN = frozenset("{}<")
 
 
 def _require_safe_text(text: str) -> None:
@@ -87,6 +89,17 @@ def _require_safe_text(text: str) -> None:
             f"set_text refuses characters that form JSX structure: {''.join(bad)!r}. "
             f"Pass plain text only."
         )
+
+
+def _text_literal(text: str) -> str:
+    """Render text content for a JSX child slot.
+
+    Plain ASCII without ``>`` stays as a bare text node. Values with ``>``
+    become a JSX string expression (``{"..."}``) so the file still parses.
+    """
+    if ">" not in text:
+        return text
+    return '{"' + _escape_attr_value(text) + '"}'
 
 
 def _reparse_ok(source: bytes) -> bool:
@@ -189,8 +202,9 @@ def _set_text_patch(
     _require_safe_text(text)
     start, end = element.text_range
     old = source[start:end].decode(errors="replace")
-    patched = source[:start] + text.encode() + source[end:]
-    return patched, old, text
+    rendered = _text_literal(text)
+    patched = source[:start] + rendered.encode() + source[end:]
+    return patched, old, rendered
 
 
 def _apply_patch(

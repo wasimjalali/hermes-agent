@@ -94,4 +94,20 @@ describe('mergeDesignChecks', () => {
     expect(next.lint.status).toBe('fail')
     expect(next.a11y_check?.status).toBe('pass')
   })
+
+  it('takes checks.tokens when prev is null', () => {
+    const next = mergeDesignChecks(null, {
+      tokens: {
+        status: 'ok',
+        tokens: [{ path: 'color.fg', value: '#fff' }]
+      },
+      contrast: { status: 'pass', pairs: [] },
+      lint: { status: 'pass', violations: [] },
+      a11y_check: { status: 'pass' },
+      visual_diff: null,
+      passed: true
+    })
+    expect(next.tokens.status).toBe('ok')
+    expect(next.tokens.tokens?.[0]?.path).toBe('color.fg')
+  })
 })
