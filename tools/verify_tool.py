@@ -426,27 +426,43 @@ def _run_rung_design_gate(manifest: BuildManifest, session: BuildSession) -> Run
     )
 
 
-_vlm_critique_cfg_loaded = False
+# Cached config read for the opt-in flag, keyed on config.yaml's mtime so an
+# edit takes effect on the next design gate without restarting the process.
+# A plain "load once" cache made `burooj.vlm_critique: true` look ignored.
+_vlm_critique_cfg_key: object = None
 _vlm_critique_cfg_value = False
 _vlm_critique_cfg_logged = False
+
+
+def _vlm_critique_cfg_mtime() -> object:
+    """Cache key: config.yaml's mtime, or None when it cannot be read."""
+    try:
+        from hermes_cli.config import get_config_path
+
+        return get_config_path().stat().st_mtime
+    except (OSError, ImportError):
+        return None
 
 
 def _vlm_critique_enabled() -> bool:
     """Whether the advisory VLM critique runs inside the design gate.
 
     Off by default. Opt in via ``BUROOJ_VLM_CRITIQUE=1`` or
-    ``burooj.vlm_critique: true`` in config.yaml.
+    ``burooj.vlm_critique: true`` in config.yaml. The env var wins over
+    config and is read every call, so it never goes stale.
     """
     import os
 
-    global _vlm_critique_cfg_loaded, _vlm_critique_cfg_value, _vlm_critique_cfg_logged
+    global _vlm_critique_cfg_key, _vlm_critique_cfg_value, _vlm_critique_cfg_logged
 
     env = os.environ.get("BUROOJ_VLM_CRITIQUE", "").strip().lower()
     if env in {"1", "true", "yes", "on"}:
         return True
     if env in {"0", "false", "no", "off"}:
         return False
-    if _vlm_critique_cfg_loaded:
+
+    key = _vlm_critique_cfg_mtime()
+    if key is not None and key == _vlm_critique_cfg_key:
         return _vlm_critique_cfg_value
     try:
         from hermes_cli.config import load_config
@@ -454,7 +470,7 @@ def _vlm_critique_enabled() -> bool:
         cfg = load_config() or {}
         flag = bool((cfg.get("burooj") or {}).get("vlm_critique"))
         _vlm_critique_cfg_value = flag
-        _vlm_critique_cfg_loaded = True
+        _vlm_critique_cfg_key = key
         return flag
     except Exception:
         if not _vlm_critique_cfg_logged:

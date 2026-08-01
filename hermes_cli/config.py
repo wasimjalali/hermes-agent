@@ -3378,19 +3378,9 @@ _FALLBACK_COMMENT = """
 #   model: anthropic/claude-sonnet-4
 """
 
-_BUROOJ_COMMENT = """
-# ── Burooj mode routing ───────────────────────────────────────────────
-# Build ("coding") and Design ("vision") model overrides. Empty or omitted
-# hints fall back to the default model. vlm_critique is opt-in advisory
-# only; it never blocks the design gate. Defaults live in DEFAULT_CONFIG
-# and are not written to disk until you set a real value.
-#
-# burooj:
-#   model_hints:
-#     coding: ""    # e.g. anthropic/claude-sonnet-4-5
-#     vision: ""    # e.g. openrouter/google/gemini-2.5-flash
-#   vlm_critique: false
-"""
+# Burooj fork addition. Text lives in hermes_cli/burooj_config.py so this
+# shared module stays close to upstream; see that file for why.
+from hermes_cli.burooj_config import BUROOJ_COMMENT as _BUROOJ_COMMENT
 
 
 _COMMENTED_SECTIONS = """

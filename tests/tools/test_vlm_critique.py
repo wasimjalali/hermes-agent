@@ -219,6 +219,68 @@ class TestVlmCritiqueLadder:
         assert "vlm_critique" not in result["results"][0]["output"]
 
 
+class TestVlmCritiqueOptInCache:
+    """The config read is cached on config.yaml's mtime, not loaded once."""
+
+    def _reset_cache(self):
+        import tools.verify_tool as vt
+
+        vt._vlm_critique_cfg_key = None
+        vt._vlm_critique_cfg_value = False
+
+    def test_config_edit_takes_effect_without_restart(self, tmp_path, monkeypatch):
+        """A 'load once' cache made `burooj.vlm_critique: true` look ignored."""
+        import time
+
+        from tools.verify_tool import _vlm_critique_enabled
+
+        monkeypatch.delenv("BUROOJ_VLM_CRITIQUE", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config = tmp_path / "config.yaml"
+        config.write_text("_config_version: 34\n", encoding="utf-8")
+        self._reset_cache()
+
+        assert _vlm_critique_enabled() is False
+
+        time.sleep(0.01)
+        config.write_text(
+            "_config_version: 34\nburooj:\n  vlm_critique: true\n", encoding="utf-8"
+        )
+        assert _vlm_critique_enabled() is True
+
+        time.sleep(0.01)
+        config.write_text(
+            "_config_version: 34\nburooj:\n  vlm_critique: false\n", encoding="utf-8"
+        )
+        assert _vlm_critique_enabled() is False
+
+    def test_env_wins_over_cached_config(self, tmp_path, monkeypatch):
+        from tools.verify_tool import _vlm_critique_enabled
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "_config_version: 34\nburooj:\n  vlm_critique: false\n", encoding="utf-8"
+        )
+        self._reset_cache()
+        assert _vlm_critique_enabled() is False
+
+        monkeypatch.setenv("BUROOJ_VLM_CRITIQUE", "1")
+        assert _vlm_critique_enabled() is True
+
+
+class TestBuroojConfigComment:
+    """The commented burooj block lives in a Burooj-owned module."""
+
+    def test_config_py_imports_the_shared_constant(self):
+        import hermes_cli.config as config
+        from hermes_cli.burooj_config import BUROOJ_COMMENT
+
+        assert config._BUROOJ_COMMENT is BUROOJ_COMMENT
+        assert "burooj:" in BUROOJ_COMMENT
+        assert "model_hints" in BUROOJ_COMMENT
+        assert "vlm_critique" in BUROOJ_COMMENT
+
+
 class TestVlmCritiqueRegistration:
     def test_registered_in_design_toolset(self):
         from tools.registry import discover_builtin_tools, registry
