@@ -9,6 +9,7 @@ that can be swapped. Today: :class:`LocalRuntime` and :class:`DockerRuntime`.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -19,6 +20,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger("hermes.build_runtime")
 
 
 @dataclass
@@ -656,6 +659,16 @@ class DockerRuntime(Runtime):
                 text=True,
             )
         except OSError as exc:
+            # The container is already up: `docker run -d` returned above.
+            # Raising without cleaning up left it running with no handle to
+            # stop it, holding the published port against the next attempt.
+            try:
+                self._run_docker(["rm", "-f", name], timeout=30)
+            except (DockerUnavailable, OSError):
+                logger.warning(
+                    "could not remove container %s after its log follower "
+                    "failed to start; it may still be running", name
+                )
             raise RuntimeError(f"docker logs failed to start for {name}: {exc}") from exc
         handle._log_proc = log_proc
 

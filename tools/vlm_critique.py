@@ -54,12 +54,18 @@ _CRITIQUE_TIMEOUT = 60
 _CRITIQUE_PROMPT = (
     "You are a design reviewer. Look at this screenshot of a web page and "
     "report ONLY concrete, actionable issues a designer could fix. For each "
-    "issue give a severity (info, minor, major), the point, and a specific "
-    "suggestion. Do not praise the page. Do not invent problems that are not "
+    "issue give a severity, the point, and a specific suggestion. Severity "
+    "must be exactly one of: info, minor, major. Do not use any other word. "
+    "Do not praise the page. Do not invent problems that are not "
     "visible. If the page looks fine, return an empty issues list. "
     "Reply with JSON: {\"issues\": [{\"severity\": \"minor\", \"point\": "
     "\"...\", \"suggestion\": \"...\"}]}"
 )
+
+
+# The severities the prompt asks for. Anything else is kept verbatim and
+# labelled, never quietly mapped onto one of these.
+_SEVERITIES = frozenset({"info", "minor", "major"})
 
 
 @dataclass
@@ -178,9 +184,13 @@ def _parse_issues_object(parsed: dict[str, Any]) -> dict[str, Any]:
     for item in issues:
         if not isinstance(item, dict):
             continue
-        severity = str(item.get("severity") or "minor")
-        if severity not in {"info", "minor", "major"}:
-            severity = "minor"
+        severity = str(item.get("severity") or "minor").strip().lower()
+        if severity not in _SEVERITIES:
+            # Do not silently rewrite this. A model reporting "critical" was
+            # being filed as "minor", which is the wrong direction to guess in
+            # and hid the strongest signal the critique had. Keep the model's
+            # word and mark it so a reader knows it was off-contract.
+            severity = f"{severity or 'unspecified'} (off-contract)"
         clean.append({
             "severity": severity,
             "point": str(item.get("point") or "").strip(),

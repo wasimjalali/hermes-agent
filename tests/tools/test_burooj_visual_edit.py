@@ -209,6 +209,82 @@ class TestSourceIndex:
         roots = {e.root for e in index.by_oid.values()}
         assert len(roots) >= 2, f"{label}: roots were not distinguished"
 
+    @pytest.mark.parametrize(
+        "label,body,expected",
+        [
+            (
+                "ternary",
+                "export default function A({ x }: any) {\n"
+                "  return <div>{x ? <b>yes</b> : <i>no</i>}</div>\n"
+                "}\n",
+                ["b", "div", "i"],
+            ),
+            (
+                "logical_and",
+                "export default function A({ x }: any) {\n"
+                "  return <div>{x && <span>and</span>}</div>\n"
+                "}\n",
+                ["div", "span"],
+            ),
+            (
+                "map_is_not_double_indexed",
+                "export default function A({ items }: any) {\n"
+                "  return <ul>{items.map((i: any) => <li key={i}>{i}</li>)}</ul>\n"
+                "}\n",
+                ["li", "ul"],
+            ),
+            (
+                "mixed",
+                "export default function A({ x, items }: any) {\n"
+                "  return (\n"
+                "    <div>\n"
+                "      {x ? <b>yes</b> : <i>no</i>}\n"
+                "      {items.map((i: any) => <li key={i}>{i}</li>)}\n"
+                "      <p>plain</p>\n"
+                "    </div>\n"
+                "  )\n"
+                "}\n",
+                ["b", "div", "i", "li", "p"],
+            ),
+        ],
+    )
+    def test_expression_container_elements_are_indexed(
+        self, tmp_path, label, body, expected
+    ):
+        """Elements in {cond ? a : b} are not element siblings.
+
+        They were skipped entirely and not reported as unmapped, so
+        visual_edit could not touch a conditional branch and could not say
+        why. A container holding a function is left to _component_functions,
+        or the same element would be indexed twice under two oids.
+        """
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        (src / "page.tsx").write_text(body, encoding="utf-8")
+
+        index = build_source_index(tmp_path, use_cache=False)
+
+        assert sorted(e.tag for e in index.by_oid.values()) == expected, label
+        assert len(set(index.by_oid)) == len(index.by_oid)
+
+    def test_conditional_branch_is_editable(self, tmp_path):
+        """The point of indexing them: an edit must land in the right branch."""
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        page = src / "page.tsx"
+        page.write_text(
+            "export default function A({ x }: any) {\n"
+            "  return <div>{x ? <b>yes</b> : <i>no</i>}</div>\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        index = build_source_index(tmp_path, use_cache=False)
+        b = next(e for e in index.by_oid.values() if e.tag == "b")
+        _, _, _, patched = _apply_patch(index, b.oid, "set_text", "", "EDITED")
+        text = patched.decode()
+        assert "<b>EDITED</b>" in text
+        assert "<i>no</i>" in text
+
     def test_root_ordinal_is_in_the_digest(self):
         assert _oid_for_path("src/a.tsx", (), "A", 0) != _oid_for_path(
             "src/a.tsx", (), "A", 1

@@ -410,10 +410,16 @@ def _run_rung_design_gate(manifest: BuildManifest, session: BuildSession) -> Run
     # opt-in. Vision models cost money, leave the machine, and are not
     # reproducible; a full ladder must not call them by default. Enable with
     # config ``burooj.vlm_critique: true`` or env ``BUROOJ_VLM_CRITIQUE=1``.
+    # Say when it is off. Emitting nothing looked identical to running and
+    # finding nothing, so a user who set burooj.vlm_critique: true and hit a
+    # config read error saw silence rather than a reason.
     vlm_result = (
         _run_rung_vlm_advisory(session)
         if _vlm_critique_enabled()
-        else []
+        else [
+            "vlm_critique: ADVISORY (off; enable with burooj.vlm_critique: "
+            "true or BUROOJ_VLM_CRITIQUE=1)"
+        ]
     )
 
     duration = int((time.monotonic() - start) * 1000)
